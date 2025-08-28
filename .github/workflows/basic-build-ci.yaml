@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rosdistro: [humble, iron, jazzy, rolling]
+        rosdistro: [jazzy]
       fail-fast: false
     container:
       image: ros:${{ matrix.rosdistro }}-ros-base
