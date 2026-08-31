@@ -65,7 +65,9 @@ RawData::RawData(const std::string & calibration_file, const std::string & model
   // RCLCPP_INFO(this->get_logger(), "Number of lasers: %d.",  calibration_->num_lasers);
 
   setupSinCosCache();
-  setupAzimuthCache();
+  if (config_.model == "VLS128") {
+    setupAzimuthCache();
+  }
 }
 
 /** Update parameters: conversions and update */
@@ -216,15 +218,6 @@ bool RawData::buildTimings()
   }
 
   if (timing_offsets_.size()) {
-    // RCLCPP_INFO(
-    //   rclcpp::get_logger("velodyne_pointcloud"),
-    //   "VELODYNE TIMING TABLE:");
-    for (size_t x = 0; x < timing_offsets_.size(); ++x) {
-      for (size_t y = 0; y < timing_offsets_[x].size(); ++y) {
-        printf("%04.3f ", timing_offsets_[x][y] * 1e6);
-      }
-      printf("\n");
-    }
     return true;
   } else {
     RCLCPP_WARN(

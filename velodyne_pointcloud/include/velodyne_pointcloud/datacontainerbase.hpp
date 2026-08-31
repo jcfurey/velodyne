@@ -33,12 +33,12 @@
 #ifndef VELODYNE_POINTCLOUD__DATACONTAINERBASE_HPP_
 #define VELODYNE_POINTCLOUD__DATACONTAINERBASE_HPP_
 
-#include <tf2/LinearMath/Quaternion.h>
-#include <tf2/LinearMath/Vector3.h>
-#include <tf2/buffer_core.h>
-#include <tf2/exceptions.h>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
+#include <tf2/LinearMath/Quaternion.hpp>
+#include <tf2/LinearMath/Vector3.hpp>
+#include <tf2/buffer_core.hpp>
+#include <tf2/exceptions.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_listener.hpp>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -89,6 +89,9 @@ public:
     cloud.height = config_.init_height;
     cloud.is_dense = static_cast<uint8_t>(config_.is_dense);
     cloud.row_step = cloud.width * cloud.point_step;
+    // Current sensor_msgs iterators require a non-empty data buffer during
+    // construction. setup() replaces this placeholder before decoding.
+    cloud.data.resize(cloud.point_step);
   }
 
   virtual ~DataContainerBase() {}
