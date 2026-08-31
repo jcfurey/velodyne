@@ -102,10 +102,19 @@ Transform::Transform(const rclcpp::NodeOptions & options)
   std::string fixed_frame = this->declare_parameter("fixed_frame", "");
   std::string target_frame = this->declare_parameter("target_frame", "");
   bool organize_cloud = this->declare_parameter("organize_cloud", true);
+  std::string vlp16_dual_return_mode = this->declare_parameter(
+    "vlp16_dual_return_mode", "both");
+  bool clip_vlp16_scan_boundaries = this->declare_parameter(
+    "clip_vlp16_scan_boundaries", false);
+  int vlp16_packet_timestamp_reference = this->declare_parameter(
+    "vlp16_packet_timestamp_reference", 0);
 
   RCLCPP_INFO(this->get_logger(), "correction angles: %s", calibration_file.c_str());
 
   data_ = std::make_unique<velodyne_rawdata::RawData>(calibration_file, model);
+  data_->setVlp16DualReturnMode(vlp16_dual_return_mode);
+  data_->setVlp16ScanBoundaryClipping(clip_vlp16_scan_boundaries);
+  data_->setVlp16PacketTimestampReference(vlp16_packet_timestamp_reference);
 
   if (organize_cloud) {
     container_ptr_ = std::make_unique<OrganizedCloudXYZIRT>(
@@ -168,7 +177,9 @@ void Transform::processScan(
       // fixed frame not available
       return;
     }
-    data_->unpack(scanMsg->packets[i], *container_ptr_, scanMsg->header.stamp);
+    data_->unpack(
+      scanMsg->packets[i], *container_ptr_, scanMsg->header.stamp,
+      i == 0, i + 1 == scanMsg->packets.size());
   }
 
   // publish the accumulated cloud message

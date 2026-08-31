@@ -33,6 +33,7 @@
 #ifndef VELODYNE_POINTCLOUD__CALIBRATION_HPP_
 #define VELODYNE_POINTCLOUD__CALIBRATION_HPP_
 
+#include <array>
 #include <map>
 #include <string>
 #include <vector>
@@ -80,9 +81,14 @@ class Calibration final
 public:
   explicit Calibration(const std::string & calibration_file);
 
+  /** Convert a measured encoder angle to the calibrated physical angle. */
+  float correctedAzimuth(float measured_angle_rad) const;
+
   float distance_resolution_m;
   std::vector<LaserCorrection> laser_corrections;
   int num_lasers{};
+  bool has_encoder_eccentricity_model{false};
+  std::array<double, 2> encoder_eccentricity_model{};
 };
 
 }  // namespace velodyne_pointcloud

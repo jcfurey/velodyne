@@ -77,6 +77,7 @@ constexpr char MAX_INTENSITY[] = "max_intensity";
 constexpr char MIN_INTENSITY[] = "min_intensity";
 constexpr char FOCAL_DISTANCE[] = "focal_distance";
 constexpr char FOCAL_SLOPE[] = "focal_slope";
+constexpr char ENCODER_ECCENTRICITY_MODEL[] = "encoder_eccentricity_model";
 
 /** Read calibration for a single laser. */
 void operator>>(const YAML::Node & node, std::pair<int, LaserCorrection> & correction)
@@ -147,6 +148,22 @@ void operator>>(const YAML::Node & node, Calibration & calibration)
   calibration.laser_corrections.clear();
   calibration.num_lasers = num_lasers;
   calibration.distance_resolution_m = distance_resolution_m;
+  calibration.has_encoder_eccentricity_model = false;
+  calibration.encoder_eccentricity_model = {0.0, 0.0};
+  if (node[ENCODER_ECCENTRICITY_MODEL]) {
+    const YAML::Node model = node[ENCODER_ECCENTRICITY_MODEL];
+    if (!model.IsSequence() || model.size() != 2) {
+      throw std::runtime_error("encoder_eccentricity_model must contain two values");
+    }
+    calibration.encoder_eccentricity_model = {
+      model[0].as<double>(), model[1].as<double>()};
+    if (!std::isfinite(calibration.encoder_eccentricity_model[0]) ||
+      !std::isfinite(calibration.encoder_eccentricity_model[1]))
+    {
+      throw std::runtime_error("encoder_eccentricity_model values must be finite");
+    }
+    calibration.has_encoder_eccentricity_model = true;
+  }
   calibration.laser_corrections.resize(num_lasers);
 
   for (int i = 0; i < num_lasers; i++) {
@@ -187,6 +204,34 @@ void operator>>(const YAML::Node & node, Calibration & calibration)
       next_angle = min_seen;
     }
   }
+}
+
+float Calibration::correctedAzimuth(float measured_angle_rad) const
+{
+  if (!has_encoder_eccentricity_model) {
+    return measured_angle_rad;
+  }
+
+  // Exyn's archived calibration implementation defines the forward model as
+  // measured = atan2(sin(true) + cy, cos(true) + cx).  The mapping is smooth
+  // and monotonic for the small physical eccentricities, so Newton iteration
+  // gives a deterministic inverse without storing a 36,000-entry YAML LUT.
+  const double cx = encoder_eccentricity_model[0];
+  const double cy = encoder_eccentricity_model[1];
+  const double measured = measured_angle_rad;
+  double angle = measured;
+  for (int iteration = 0; iteration < 6; ++iteration) {
+    const double sine = std::sin(angle);
+    const double cosine = std::cos(angle);
+    const double x = cosine + cx;
+    const double y = sine + cy;
+    const double predicted = std::atan2(y, x);
+    const double residual = std::atan2(
+      std::sin(predicted - measured), std::cos(predicted - measured));
+    const double derivative = (x * cosine + y * sine) / (x * x + y * y);
+    angle -= residual / derivative;
+  }
+  return static_cast<float>(angle);
 }
 
 Calibration::Calibration(const std::string & calibration_file)

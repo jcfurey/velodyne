@@ -143,9 +143,19 @@ public:
 
   void unpack(
     const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
-    const rclcpp::Time & scan_start_time);
+    const rclcpp::Time & scan_start_time, bool is_first_packet = false,
+    bool is_last_packet = false);
 
   void setParameters(double min_range, double max_range, double view_direction, double view_width);
+
+  /** Select how paired VLP-16 dual returns are represented. */
+  void setVlp16DualReturnMode(const std::string & mode);
+
+  /** Clip an overlapping first/last packet at its VLP-16 azimuth wrap. */
+  void setVlp16ScanBoundaryClipping(bool enabled);
+
+  /** Select the VLP-16 firing sequence represented by each packet stamp. */
+  void setVlp16PacketTimestampReference(int firing_sequence);
 
   int scansPerPacket() const;
 
@@ -162,6 +172,10 @@ private:
     int max_angle;                ///< maximum angle to publish
   };
   Config config_{};
+  enum class Vlp16DualReturnMode {Both, Strongest, Last};
+  Vlp16DualReturnMode vlp16_dual_return_mode_{Vlp16DualReturnMode::Both};
+  bool clip_vlp16_scan_boundaries_{false};
+  int vlp16_packet_timestamp_reference_{0};
 
   /**
    * Calibration file
@@ -187,7 +201,7 @@ private:
   /** add private function to handle the VLP16 **/
   void unpack_vlp16(
     const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
-    const rclcpp::Time & scan_start_time);
+    const rclcpp::Time & scan_start_time, bool is_first_packet, bool is_last_packet);
 
   void unpack_vls128(
     const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,

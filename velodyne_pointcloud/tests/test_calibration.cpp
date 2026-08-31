@@ -70,6 +70,8 @@ TEST(Calibration, vlp16)
   EXPECT_FLOAT_EQ(laser.horiz_offset_correction, 0.0);
   EXPECT_EQ(laser.max_intensity, 255);
   EXPECT_EQ(laser.min_intensity, 0);
+  EXPECT_FALSE(calibration.has_encoder_eccentricity_model);
+  EXPECT_FLOAT_EQ(calibration.correctedAzimuth(1.25F), 1.25F);
 
   // check similar values for the last laser:
   laser = calibration.laser_corrections[15];

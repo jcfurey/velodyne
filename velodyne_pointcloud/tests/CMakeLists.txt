@@ -23,3 +23,12 @@ target_link_libraries(test_calibration
   rclcpp::rclcpp
   velodyne_rawdata
 )
+
+ament_add_gtest(test_vlp16_exyn
+  test_vlp16_exyn.cpp
+)
+target_link_libraries(test_vlp16_exyn
+  ament_index_cpp::ament_index_cpp
+  rclcpp::rclcpp
+  velodyne_rawdata
+)

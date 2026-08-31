@@ -34,6 +34,7 @@
 
 #include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <cassert>
 
@@ -95,6 +96,34 @@ void RawData::setParameters(
     config_.min_angle = 0;
     config_.max_angle = 36000;
   }
+}
+
+void RawData::setVlp16DualReturnMode(const std::string & mode)
+{
+  if (mode == "both") {
+    vlp16_dual_return_mode_ = Vlp16DualReturnMode::Both;
+  } else if (mode == "strongest") {
+    vlp16_dual_return_mode_ = Vlp16DualReturnMode::Strongest;
+  } else if (mode == "last") {
+    vlp16_dual_return_mode_ = Vlp16DualReturnMode::Last;
+  } else {
+    throw std::invalid_argument(
+            "vlp16_dual_return_mode must be one of: both, strongest, last");
+  }
+}
+
+void RawData::setVlp16ScanBoundaryClipping(bool enabled)
+{
+  clip_vlp16_scan_boundaries_ = enabled;
+}
+
+void RawData::setVlp16PacketTimestampReference(int firing_sequence)
+{
+  if (firing_sequence < 0 || firing_sequence >= BLOCKS_PER_PACKET) {
+    throw std::invalid_argument(
+            "vlp16_packet_timestamp_reference must be in [0, 11]");
+  }
+  vlp16_packet_timestamp_reference_ = firing_sequence;
 }
 
 int RawData::scansPerPacket() const
@@ -236,7 +265,8 @@ void RawData::setupSinCosCache()
 {
   // Set up cached values for sin and cos of all the possible headings
   for (uint16_t rot_index = 0; rot_index < ROTATION_MAX_UNITS; ++rot_index) {
-    float rotation = angles::from_degrees(ROTATION_RESOLUTION * rot_index);
+    float rotation = calibration_->correctedAzimuth(
+      angles::from_degrees(ROTATION_RESOLUTION * rot_index));
     cos_rot_table_[rot_index] = ::cosf(rotation);
     sin_rot_table_[rot_index] = ::sinf(rotation);
   }
@@ -263,7 +293,7 @@ void RawData::setupAzimuthCache()
  */
 void RawData::unpack(
   const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
-  const rclcpp::Time & scan_start_time)
+  const rclcpp::Time & scan_start_time, bool is_first_packet, bool is_last_packet)
 {
   // RCLCPP_DEBUG(this->get_logger(), "Received packet, time: %s", pkt.stamp);
 
@@ -275,7 +305,7 @@ void RawData::unpack(
 
   /** special parsing for the VLP16 **/
   if (calibration_->num_lasers == 16) {
-    unpack_vlp16(pkt, data, scan_start_time);
+    unpack_vlp16(pkt, data, scan_start_time, is_first_packet, is_last_packet);
     return;
   }
 
@@ -626,7 +656,7 @@ void RawData::unpack_vls128(
  */
 void RawData::unpack_vlp16(
   const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
-  const rclcpp::Time & scan_start_time)
+  const rclcpp::Time & scan_start_time, bool is_first_packet, bool is_last_packet)
 {
   float azimuth;
   float azimuth_diff;
@@ -642,7 +672,33 @@ void RawData::unpack_vlp16(
 
   const raw_packet * raw = reinterpret_cast<const raw_packet *>(&pkt.data[0]);
 
-  for (int block = 0; block < BLOCKS_PER_PACKET; block++) {
+  const bool dual_return = pkt.data[1204] == 57;
+  const bool select_one_return =
+    dual_return && vlp16_dual_return_mode_ != Vlp16DualReturnMode::Both;
+  const int block_step = select_one_return ? 2 : 1;
+  int boundary_block = -1;
+  for (int block = 1; block < BLOCKS_PER_PACKET; ++block) {
+    if (raw->blocks[block].rotation < raw->blocks[block - 1].rotation) {
+      boundary_block = block;
+      break;
+    }
+  }
+
+  for (int paired_block = 0; paired_block < BLOCKS_PER_PACKET; paired_block += block_step) {
+    if (clip_vlp16_scan_boundaries_ && boundary_block >= 0) {
+      if (is_first_packet && paired_block < boundary_block) {
+        continue;
+      }
+      if (is_last_packet && paired_block >= boundary_block) {
+        continue;
+      }
+    }
+    int block = paired_block;
+    if (select_one_return && vlp16_dual_return_mode_ == Vlp16DualReturnMode::Last) {
+      block += 1;
+    }
+    const int timing_block = dual_return ? paired_block / 2 : block;
+
     // ignore packets with mangled or otherwise different contents
     if (UPPER_BANK != raw->blocks[block].header) {
       return;  // bad packet: skip the rest
@@ -651,12 +707,20 @@ void RawData::unpack_vlp16(
     // Calculate difference between current and next block's azimuth angle.
     azimuth = static_cast<float>(raw->blocks[block].rotation);
 
-    if (block < (BLOCKS_PER_PACKET - 1)) {
-      raw_azimuth_diff = raw->blocks[block + 1].rotation - raw->blocks[block].rotation;
+    int next_block = block + 1;
+    if (dual_return) {
+      // Dual-return blocks are adjacent strongest/last pairs with the same
+      // azimuth. Interpolate against the next firing-sequence pair.
+      next_block = paired_block + 2;
+    }
+    if (next_block < BLOCKS_PER_PACKET) {
+      raw_azimuth_diff = raw->blocks[next_block].rotation - raw->blocks[block].rotation;
       azimuth_diff = static_cast<float>((36000 + raw_azimuth_diff) % 36000);
 
-      // some packets contain an angle overflow where azimuth_diff < 0
-      if (raw_azimuth_diff < 0) {
+      // A large negative delta is the normal 360-to-0 scan boundary and the
+      // positive modulo above is correct. Reuse the last speed estimate only
+      // for a small backwards encoder glitch.
+      if (raw_azimuth_diff < 0 && raw_azimuth_diff > -18000) {
         // raw->blocks[block+1].rotation - raw->blocks[block].rotation < 0)
         // RCLCPP_WARN(
         //   get_logger(), "Packet containing angle overflow, first angle: %u second angle: %u",
@@ -803,7 +867,9 @@ void RawData::unpack_vlp16(
 
           float time = 0;
           if (timing_offsets_.size()) {
-            time = timing_offsets_[block][firing * 16 + dsr] + time_diff_start_to_this_packet;
+            time = timing_offsets_[timing_block][firing * 16 + dsr] +
+              time_diff_start_to_this_packet -
+              timing_offsets_[vlp16_packet_timestamp_reference_][0];
           }
 
           data.addPoint(
