@@ -32,9 +32,9 @@
 
 #include <gtest/gtest.h>
 
-#include <tf2/buffer_core.hpp>
-
 #include <memory>
+
+#include <tf2/buffer_core.hpp>
 
 #include "velodyne_pointcloud/datacontainerbase.hpp"
 

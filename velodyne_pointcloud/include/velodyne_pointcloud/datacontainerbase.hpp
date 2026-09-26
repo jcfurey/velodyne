@@ -33,13 +33,6 @@
 #ifndef VELODYNE_POINTCLOUD__DATACONTAINERBASE_HPP_
 #define VELODYNE_POINTCLOUD__DATACONTAINERBASE_HPP_
 
-#include <tf2/LinearMath/Quaternion.hpp>
-#include <tf2/LinearMath/Vector3.hpp>
-#include <tf2/buffer_core.hpp>
-#include <tf2/exceptions.hpp>
-#include <tf2_ros/buffer.hpp>
-#include <tf2_ros/transform_listener.hpp>
-
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
@@ -47,6 +40,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+
+#include <tf2/LinearMath/Quaternion.hpp>
+#include <tf2/LinearMath/Vector3.hpp>
+#include <tf2/buffer_core.hpp>
+#include <tf2/exceptions.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_listener.hpp>
 
 #include <rclcpp/time.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
