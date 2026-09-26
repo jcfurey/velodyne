@@ -123,7 +123,10 @@ install(DIRECTORY config launch params
 
 if(BUILD_TESTING)
   # Remove empty.xml from lint
+  # Upstream sources keep their original ROS 1-era BSD notices, which
+  # ament_copyright cannot parse; do not rewrite third-party headers.
   list(APPEND AMENT_LINT_AUTO_EXCLUDE
+    ament_cmake_copyright
     ament_cmake_xmllint
   )
 
@@ -145,6 +148,10 @@ if(BUILD_TESTING)
   find_package(ament_cmake_xmllint REQUIRED)
 
   ament_xmllint(${XML_FILES})
+
+  # Files created by this fork carry recognized notices; keep them checked.
+  find_package(ament_cmake_copyright REQUIRED)
+  ament_copyright(TESTNAME copyright_fork tests/test_vlp16_exyn.cpp)
 
   add_subdirectory(tests)
 endif()

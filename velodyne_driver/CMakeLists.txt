@@ -74,6 +74,9 @@ install(PROGRAMS src/vdump
 
 
 if(BUILD_TESTING)
+  # Upstream sources keep their original ROS 1-era BSD notices, which
+  # ament_copyright cannot parse; do not rewrite third-party headers.
+  list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_copyright)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 
