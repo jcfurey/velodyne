@@ -32,18 +32,18 @@
 
 #include "velodyne_pointcloud/transform.hpp"
 
-#include <tf2_ros/message_filter.hpp>
-#include <tf2_ros/transform_listener.hpp>
-
 #include <cmath>
 #include <functional>
 #include <memory>
 #include <string>
 
 #include <rcl_interfaces/msg/floating_point_range.hpp>
+#include <rcl_interfaces/msg/integer_range.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
+#include <tf2_ros/message_filter.hpp>
+#include <tf2_ros/transform_listener.hpp>
 
 #include "velodyne_pointcloud/organized_cloudXYZIRT.hpp"
 #include "velodyne_pointcloud/pointcloudXYZIRT.hpp"
@@ -102,12 +102,39 @@ Transform::Transform(const rclcpp::NodeOptions & options)
   std::string fixed_frame = this->declare_parameter("fixed_frame", "");
   std::string target_frame = this->declare_parameter("target_frame", "");
   bool organize_cloud = this->declare_parameter("organize_cloud", true);
+
+  rcl_interfaces::msg::ParameterDescriptor vlp16_dual_return_mode_desc;
+  vlp16_dual_return_mode_desc.name = "vlp16_dual_return_mode";
+  vlp16_dual_return_mode_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_STRING;
+  vlp16_dual_return_mode_desc.description =
+    "VLP-16 dual-return selection: both, last (first block of each pair), or "
+    "strongest (second block)";
   std::string vlp16_dual_return_mode = this->declare_parameter(
-    "vlp16_dual_return_mode", "both");
+    "vlp16_dual_return_mode", "both", vlp16_dual_return_mode_desc);
+
+  rcl_interfaces::msg::ParameterDescriptor clip_vlp16_scan_boundaries_desc;
+  clip_vlp16_scan_boundaries_desc.name = "clip_vlp16_scan_boundaries";
+  clip_vlp16_scan_boundaries_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_BOOL;
+  clip_vlp16_scan_boundaries_desc.description =
+    "clip the first and last VLP-16 packets of each scan at their azimuth wrap";
   bool clip_vlp16_scan_boundaries = this->declare_parameter(
-    "clip_vlp16_scan_boundaries", false);
+    "clip_vlp16_scan_boundaries", false, clip_vlp16_scan_boundaries_desc);
+
+  rcl_interfaces::msg::ParameterDescriptor vlp16_packet_timestamp_reference_desc;
+  vlp16_packet_timestamp_reference_desc.name = "vlp16_packet_timestamp_reference";
+  vlp16_packet_timestamp_reference_desc.type =
+    rcl_interfaces::msg::ParameterType::PARAMETER_INTEGER;
+  vlp16_packet_timestamp_reference_desc.description =
+    "VLP-16 block (single return, 0-11) or block pair (dual return, 0-5) whose "
+    "firing time each packet stamp represents";
+  rcl_interfaces::msg::IntegerRange vlp16_packet_timestamp_reference_range;
+  vlp16_packet_timestamp_reference_range.from_value = 0;
+  vlp16_packet_timestamp_reference_range.to_value = 11;
+  vlp16_packet_timestamp_reference_range.step = 1;
+  vlp16_packet_timestamp_reference_desc.integer_range.push_back(
+    vlp16_packet_timestamp_reference_range);
   int vlp16_packet_timestamp_reference = this->declare_parameter(
-    "vlp16_packet_timestamp_reference", 0);
+    "vlp16_packet_timestamp_reference", 0, vlp16_packet_timestamp_reference_desc);
 
   RCLCPP_INFO(this->get_logger(), "correction angles: %s", calibration_file.c_str());
 

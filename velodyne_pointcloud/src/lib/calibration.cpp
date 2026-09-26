@@ -162,6 +162,14 @@ void operator>>(const YAML::Node & node, Calibration & calibration)
     {
       throw std::runtime_error("encoder_eccentricity_model values must be finite");
     }
+    // Physical encoder eccentricities are a few thousandths of the encoder
+    // radius. The Newton inverse below stops converging near 0.9.
+    if (!(std::hypot(
+        calibration.encoder_eccentricity_model[0],
+        calibration.encoder_eccentricity_model[1]) < 0.1))
+    {
+      throw std::runtime_error("encoder_eccentricity_model magnitude must be below 0.1");
+    }
     calibration.has_encoder_eccentricity_model = true;
   }
   calibration.laser_corrections.resize(num_lasers);
@@ -230,6 +238,12 @@ float Calibration::correctedAzimuth(float measured_angle_rad) const
       std::sin(predicted - measured), std::cos(predicted - measured));
     const double derivative = (x * cosine + y * sine) / (x * x + y * y);
     angle -= residual / derivative;
+  }
+  const double predicted = std::atan2(std::sin(angle) + cy, std::cos(angle) + cx);
+  const double residual = std::atan2(
+    std::sin(predicted - measured), std::cos(predicted - measured));
+  if (!(std::abs(residual) < 1e-9)) {
+    throw std::runtime_error("encoder eccentricity inverse did not converge");
   }
   return static_cast<float>(angle);
 }
