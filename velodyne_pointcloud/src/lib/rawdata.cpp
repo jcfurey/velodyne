@@ -117,13 +117,13 @@ void RawData::setVlp16ScanBoundaryClipping(bool enabled)
   clip_vlp16_scan_boundaries_ = enabled;
 }
 
-void RawData::setVlp16PacketTimestampReference(int firing_sequence)
+void RawData::setVlp16PacketTimestampReference(int block_reference)
 {
-  if (firing_sequence < 0 || firing_sequence >= BLOCKS_PER_PACKET) {
+  if (block_reference < 0 || block_reference >= BLOCKS_PER_PACKET) {
     throw std::invalid_argument(
             "vlp16_packet_timestamp_reference must be in [0, 11]");
   }
-  vlp16_packet_timestamp_reference_ = firing_sequence;
+  vlp16_packet_timestamp_reference_ = block_reference;
 }
 
 int RawData::scansPerPacket() const
@@ -673,6 +673,12 @@ void RawData::unpack_vlp16(
   const raw_packet * raw = reinterpret_cast<const raw_packet *>(&pkt.data[0]);
 
   const bool dual_return = pkt.data[1204] == 57;
+  if (dual_return && vlp16_packet_timestamp_reference_ >= BLOCKS_PER_PACKET / 2) {
+    RCLCPP_WARN_ONCE(
+      rclcpp::get_logger("velodyne_pointcloud"),
+      "vlp16_packet_timestamp_reference %d is outside the six dual-return block pairs",
+      vlp16_packet_timestamp_reference_);
+  }
   const bool select_one_return =
     dual_return && vlp16_dual_return_mode_ != Vlp16DualReturnMode::Both;
   const int block_step = select_one_return ? 2 : 1;
@@ -694,7 +700,10 @@ void RawData::unpack_vlp16(
       }
     }
     int block = paired_block;
-    if (select_one_return && vlp16_dual_return_mode_ == Vlp16DualReturnMode::Last) {
+    // VLP-16 manual, dual-return packet format: each block pair shares one
+    // azimuth; the first block holds the last return and the second holds the
+    // strongest (or the second strongest when the strongest is also the last).
+    if (select_one_return && vlp16_dual_return_mode_ == Vlp16DualReturnMode::Strongest) {
       block += 1;
     }
     const int timing_block = dual_return ? paired_block / 2 : block;
@@ -709,7 +718,7 @@ void RawData::unpack_vlp16(
 
     int next_block = block + 1;
     if (dual_return) {
-      // Dual-return blocks are adjacent strongest/last pairs with the same
+      // Dual-return blocks are adjacent last/strongest pairs with the same
       // azimuth. Interpolate against the next firing-sequence pair.
       next_block = paired_block + 2;
     }
@@ -739,6 +748,17 @@ void RawData::unpack_vlp16(
       last_azimuth_diff = azimuth_diff;
     } else {
       azimuth_diff = last_azimuth_diff;
+      const int previous_block = block - (dual_return ? 2 : 1);
+      if (azimuth_diff <= 0.0f && previous_block >= 0) {
+        // Boundary clipping can skip every earlier block of the first packet.
+        // Estimate the speed from the preceding block (pair) instead of
+        // leaving the firing and per-laser offsets uninterpolated.
+        const int previous_diff =
+          (36000 + raw->blocks[block].rotation - raw->blocks[previous_block].rotation) % 36000;
+        if (previous_diff < 18000) {
+          azimuth_diff = static_cast<float>(previous_diff);
+        }
+      }
     }
 
     for (int firing = 0, k = 0; firing < VLP16_FIRINGS_PER_BLOCK; firing++) {

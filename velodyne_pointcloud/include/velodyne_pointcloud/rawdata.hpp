@@ -148,14 +148,21 @@ public:
 
   void setParameters(double min_range, double max_range, double view_direction, double view_width);
 
-  /** Select how paired VLP-16 dual returns are represented. */
+  /** Select how paired VLP-16 dual returns are represented.
+   *
+   *  "last" keeps the first block of each pair and "strongest" the second;
+   *  "both" keeps both blocks.
+   */
   void setVlp16DualReturnMode(const std::string & mode);
 
   /** Clip an overlapping first/last packet at its VLP-16 azimuth wrap. */
   void setVlp16ScanBoundaryClipping(bool enabled);
 
-  /** Select the VLP-16 firing sequence represented by each packet stamp. */
-  void setVlp16PacketTimestampReference(int firing_sequence);
+  /** Select the VLP-16 block (single return) or block pair (dual return)
+   *  whose firing time each packet stamp represents. Dual-return packets
+   *  contain six pairs, so only references 0-5 lie inside the packet.
+   */
+  void setVlp16PacketTimestampReference(int block_reference);
 
   int scansPerPacket() const;
 
