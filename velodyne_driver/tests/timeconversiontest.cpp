@@ -32,24 +32,16 @@
 
 #include <gtest/gtest.h>
 
-#include <cmath>
-#include <memory>
-
 #include <rclcpp/rclcpp.hpp>
 
 #include "velodyne_driver/time_conversion.hpp"
 
 TEST(TimeConversion, BytesToTimestamp)
 {
-  auto clock_ = std::make_shared<rclcpp::Clock>();
-  auto ros_stamp = clock_->now();
-
-  double secs;
-  double fractpart = std::modf(ros_stamp.seconds(), &secs);
-  double nanosecs = fractpart * 1000000000;
-  // get the seconds past the hour and multiply by 1million to convert to microseconds
-  // divide nanoseconds by 1000 to convert to microseconds
-  uint32_t since_the_hour = ((static_cast<int>(secs) % 3600) * 1000000) + (nanosecs / 1000);
+  // Use an exact microsecond timestamp and 64-bit arithmetic so the test is
+  // deterministic and remains valid near the end of an hour and after 2038.
+  const rclcpp::Time ros_stamp(2208988799123456000LL, RCL_ROS_TIME);
+  const uint32_t since_the_hour = (ros_stamp.nanoseconds() / 1000) % 3600000000ULL;
 
   uint8_t native_format[4];
   native_format[0] = 0xFF & since_the_hour;
@@ -59,7 +51,37 @@ TEST(TimeConversion, BytesToTimestamp)
 
   rclcpp::Time ros_stamp_converted = rosTimeFromGpsTimestamp(ros_stamp, native_format);
 
-  ASSERT_NEAR(ros_stamp_converted.nanoseconds(), ros_stamp.nanoseconds(), 2000);
+  ASSERT_EQ(ros_stamp_converted.nanoseconds(), ros_stamp.nanoseconds());
+}
+
+TEST(TimeConversion, preserves_nanoseconds_and_clock_at_next_hour)
+{
+  const rclcpp::Time nominal(3600LL * 1000000000 + 100000000, RCL_ROS_TIME);
+  const rclcpp::Time previous(3600LL * 1000000000 - 123456789, RCL_ROS_TIME);
+  const rclcpp::Time wrong_hour(previous.nanoseconds() + 3600LL * 1000000000, RCL_ROS_TIME);
+  const auto converted = resolveHourAmbiguity(wrong_hour, nominal);
+  EXPECT_EQ(converted.nanoseconds(), previous.nanoseconds());
+  EXPECT_EQ(converted.get_clock_type(), RCL_ROS_TIME);
+}
+
+TEST(TimeConversion, preserves_nanoseconds_and_clock_at_previous_hour)
+{
+  const rclcpp::Time nominal(7200LL * 1000000000 - 100000000, RCL_ROS_TIME);
+  const rclcpp::Time next(7200LL * 1000000000 + 123456789, RCL_ROS_TIME);
+  const rclcpp::Time wrong_hour(next.nanoseconds() - 3600LL * 1000000000, RCL_ROS_TIME);
+  EXPECT_EQ(resolveHourAmbiguity(wrong_hour, nominal).nanoseconds(), next.nanoseconds());
+}
+
+TEST(TimeConversion, gps_timestamp_keeps_ros_clock_and_microsecond_precision)
+{
+  const rclcpp::Time nominal(3600LL * 1000000000 + 123456000, RCL_ROS_TIME);
+  const uint32_t micros = 123456;
+  const uint8_t bytes[] = {
+    static_cast<uint8_t>(micros), static_cast<uint8_t>(micros >> 8),
+    static_cast<uint8_t>(micros >> 16), static_cast<uint8_t>(micros >> 24)};
+  const auto converted = rosTimeFromGpsTimestamp(nominal, bytes);
+  EXPECT_EQ(converted.nanoseconds(), nominal.nanoseconds());
+  EXPECT_EQ(converted.get_clock_type(), nominal.get_clock_type());
 }
 
 int main(int argc, char ** argv)

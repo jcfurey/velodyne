@@ -33,8 +33,6 @@
 #ifndef VELODYNE_POINTCLOUD__RAWDATA_HPP_
 #define VELODYNE_POINTCLOUD__RAWDATA_HPP_
 
-#include <pcl/point_cloud.h>
-
 #include <memory>
 #include <string>
 #include <vector>
@@ -208,11 +206,12 @@ private:
   /** add private function to handle the VLP16 **/
   void unpack_vlp16(
     const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
-    const rclcpp::Time & scan_start_time, bool is_first_packet, bool is_last_packet);
+    const rclcpp::Time & scan_start_time, bool is_first_packet, bool is_last_packet,
+    const raw_packet & raw);
 
   void unpack_vls128(
     const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
-    const rclcpp::Time & scan_start_time);
+    const rclcpp::Time & scan_start_time, const raw_packet & raw);
 
   /** in-line test whether a point is in range */
   inline bool pointInRange(const float range)

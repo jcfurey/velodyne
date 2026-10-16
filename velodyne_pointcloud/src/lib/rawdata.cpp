@@ -33,6 +33,7 @@
 #include <angles/angles.h>
 
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -45,6 +46,26 @@
 
 namespace velodyne_rawdata
 {
+
+namespace
+{
+uint16_t readLittle16(const uint8_t * data)
+{
+  return static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+}
+
+raw_packet decodePacket(const velodyne_msgs::msg::VelodynePacket & pkt)
+{
+  raw_packet decoded{};
+  for (int block = 0; block < BLOCKS_PER_PACKET; ++block) {
+    const auto * source = pkt.data.data() + block * SIZE_BLOCK;
+    decoded.blocks[block].header = readLittle16(source);
+    decoded.blocks[block].rotation = readLittle16(source + 2);
+    std::memcpy(decoded.blocks[block].data, source + 4, BLOCK_DATA_SIZE);
+  }
+  return decoded;
+}
+}  // namespace
 
 inline float square(float val)
 {
@@ -61,6 +82,12 @@ RawData::RawData(const std::string & calibration_file, const std::string & model
 {
   calibration_ = std::make_unique<velodyne_pointcloud::Calibration>(calibration_file);
   config_.model = model;
+  const int expected_lasers = model == "VLP16" ? 16 :
+    (model == "32C" || model == "32E") ? 32 : model == "VLS128" ? 128 :
+    (model == "64E" || model == "64E_S2" || model == "64E_S2.1" || model == "64E_S3") ? 64 : 0;
+  if (expected_lasers == 0 || calibration_->num_lasers != expected_lasers) {
+    throw std::invalid_argument("Calibration laser count does not match the configured model");
+  }
   buildTimings();
 
   // RCLCPP_INFO(this->get_logger(), "Number of lasers: %d.",  calibration_->num_lasers);
@@ -75,6 +102,12 @@ RawData::RawData(const std::string & calibration_file, const std::string & model
 void RawData::setParameters(
   double min_range, double max_range, double view_direction, double view_width)
 {
+  if (!std::isfinite(min_range) || !std::isfinite(max_range) || min_range < 0.0 ||
+    min_range > max_range || !std::isfinite(view_direction) ||
+    !std::isfinite(view_width) || view_width < 0.0 || view_width > 2.0 * M_PI)
+  {
+    throw std::invalid_argument("Invalid range or view configuration");
+  }
   config_.min_range = min_range;
   config_.max_range = max_range;
 
@@ -91,8 +124,8 @@ void RawData::setParameters(
   config_.min_angle = std::lround(100.0 * (2.0 * M_PI - tmp_min_angle) * 180.0 / M_PI);
   config_.max_angle = std::lround(100.0 * (2.0 * M_PI - tmp_max_angle) * 180.0 / M_PI);
 
-  if (config_.min_angle == config_.max_angle) {
-    // avoid returning empty cloud if min_angle = max_angle
+  if (view_width == 2.0 * M_PI) {
+    // Full revolutions have identical normalized endpoints.
     config_.min_angle = 0;
     config_.max_angle = 36000;
   }
@@ -211,7 +244,7 @@ bool RawData::buildTimings()
         } else {
           dataBlockIndex = x;
         }
-        dataPointIndex = y / 2;
+        dataPointIndex = y;
         timing_offsets_[x][y] = (full_firing_cycle * dataBlockIndex) +
           (single_firing * dataPointIndex);
       }
@@ -295,24 +328,35 @@ void RawData::unpack(
   const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
   const rclcpp::Time & scan_start_time, bool is_first_packet, bool is_last_packet)
 {
-  // RCLCPP_DEBUG(this->get_logger(), "Received packet, time: %s", pkt.stamp);
-
-  /** special parsing for the VLS128 **/
-  if (pkt.data[1205] == VLS128_MODEL_ID) {  // VLS 128
-    unpack_vls128(pkt, data, scan_start_time);
+  const raw_packet decoded = decodePacket(pkt);
+  const raw_packet * raw = &decoded;
+  const bool is_vls128 = config_.model == "VLS128";
+  if ((pkt.data[1205] == VLS128_MODEL_ID) != is_vls128) {
     return;
   }
-
-  /** special parsing for the VLP16 **/
+  const int blocks = is_vls128 && pkt.data[1204] == 57 ? 8 : BLOCKS_PER_PACKET;
+  for (int block = 0; block < blocks; ++block) {
+    const auto & current = raw->blocks[block];
+    const uint16_t vls_banks[] = {VLS128_BANK_1, VLS128_BANK_2, VLS128_BANK_3, VLS128_BANK_4};
+    const int bank_index = pkt.data[1204] == 57 ? block / 2 : block;
+    const bool valid_bank = is_vls128 ? current.header == vls_banks[bank_index % 4] :
+      (current.header == UPPER_BANK ||
+      (calibration_->num_lasers == 64 && current.header == LOWER_BANK));
+    if (!valid_bank || current.rotation >= ROTATION_MAX_UNITS) {
+      return;
+    }
+  }
+  if (is_vls128) {
+    unpack_vls128(pkt, data, scan_start_time, decoded);
+    return;
+  }
   if (calibration_->num_lasers == 16) {
-    unpack_vlp16(pkt, data, scan_start_time, is_first_packet, is_last_packet);
+    unpack_vlp16(pkt, data, scan_start_time, is_first_packet, is_last_packet, decoded);
     return;
   }
 
   float time_diff_start_to_this_packet =
     (rclcpp::Time(pkt.stamp) - scan_start_time).seconds();
-
-  const raw_packet * raw = reinterpret_cast<const raw_packet *>(&pkt.data[0]);
 
   for (int i = 0; i < BLOCKS_PER_PACKET; i++) {
     // upper bank lasers are numbered [0..31]
@@ -325,6 +369,18 @@ void RawData::unpack(
       bank_origin = 32;
     }
 
+    const int block_step = pkt.data[1204] == 57 ? 2 : 1;
+    int azimuth_delta = 0;
+    if (calibration_->num_lasers == 32) {
+      const int adjacent = i + block_step < BLOCKS_PER_PACKET ? i + block_step : i - block_step;
+      const int delta = adjacent > i ? raw->blocks[adjacent].rotation - raw->blocks[i].rotation :
+        raw->blocks[i].rotation - raw->blocks[adjacent].rotation;
+      azimuth_delta = (ROTATION_MAX_UNITS + delta) % ROTATION_MAX_UNITS;
+      if (azimuth_delta > ROTATION_MAX_UNITS / 2) {
+        azimuth_delta = 0;
+      }
+    }
+
     for (int j = 0, k = 0; j < SCANS_PER_BLOCK; j++, k += RAW_SCAN_SIZE) {
       float x, y, z;
       float intensity;
@@ -335,25 +391,31 @@ void RawData::unpack(
 
       /** Position Calculation */
       const raw_block & block = raw->blocks[i];
-      union two_bytes tmp{};
-      tmp.bytes[0] = block.data[k];
-      tmp.bytes[1] = block.data[k + 1];
+      const uint16_t raw_distance = readLittle16(block.data + k);
+      int rotation = block.rotation;
+      if (calibration_->num_lasers == 32) {
+        const double firing_fraction = config_.model == "32C" ?
+          (j / 2) * 2.304 / 55.296 : j * 1.152 / 46.080;
+        rotation = (rotation + static_cast<int>(std::lround(azimuth_delta * firing_fraction))) %
+          ROTATION_MAX_UNITS;
+      }
 
       /*condition added to avoid calculating points which are not
         in the interesting defined area (min_angle < area < max_angle)*/
       if ((config_.min_angle < config_.max_angle &&
-        block.rotation >= config_.min_angle &&
-        block.rotation <= config_.max_angle) ||
+        rotation >= config_.min_angle &&
+        rotation <= config_.max_angle) ||
         (config_.min_angle > config_.max_angle &&
-        (block.rotation <= config_.max_angle ||
-        block.rotation >= config_.min_angle)))
+        (rotation <= config_.max_angle ||
+        rotation >= config_.min_angle)))
       {
-        float time = 0;
-        if (timing_offsets_.size()) {
-          time = timing_offsets_[i][j] + time_diff_start_to_this_packet;
+        float time = time_diff_start_to_this_packet;
+        if (!timing_offsets_.empty()) {
+          const int timing_block = pkt.data[1204] == 57 ? i / 2 : i;
+          time += timing_offsets_[timing_block][j];
         }
 
-        if (tmp.uint == 0) {  // no valid laser beam return
+        if (raw_distance == 0) {  // no valid laser beam return
           // call to addPoint is still required since output could be organized
           data.addPoint(
             nanf(""), nanf(""), nanf(""), corrections.laser_ring,
@@ -361,7 +423,7 @@ void RawData::unpack(
           continue;
         }
 
-        float distance = tmp.uint * calibration_->distance_resolution_m;
+        float distance = raw_distance * calibration_->distance_resolution_m;
         distance += corrections.dist_correction;
 
         float cos_vert_angle = corrections.cos_vert_correction;
@@ -372,11 +434,11 @@ void RawData::unpack(
         // cos(a-b) = cos(a)*cos(b) + sin(a)*sin(b)
         // sin(a-b) = sin(a)*cos(b) - cos(a)*sin(b)
         float cos_rot_angle =
-          cos_rot_table_[block.rotation] * cos_rot_correction +
-          sin_rot_table_[block.rotation] * sin_rot_correction;
+          cos_rot_table_[rotation] * cos_rot_correction +
+          sin_rot_table_[rotation] * sin_rot_correction;
         float sin_rot_angle =
-          sin_rot_table_[block.rotation] * cos_rot_correction -
-          cos_rot_table_[block.rotation] * sin_rot_correction;
+          sin_rot_table_[rotation] * cos_rot_correction -
+          cos_rot_table_[rotation] * sin_rot_correction;
 
         float horiz_offset = corrections.horiz_offset_correction;
         float vert_offset = corrections.vert_offset_correction;
@@ -462,7 +524,8 @@ void RawData::unpack(
           (1.0f - corrections.focal_distance / 13100.0f);
         float focal_slope = corrections.focal_slope;
         intensity += focal_slope *
-          (std::abs(focal_offset - 256.0f * square((1.0f - distance) / 65535.0f)));
+          (std::abs(focal_offset - 256.0f *
+            square(1.0f - static_cast<float>(raw_distance) / 65535.0f)));
         intensity = (intensity < min_intensity) ? min_intensity : intensity;
         intensity = (intensity > max_intensity) ? max_intensity : intensity;
 
@@ -483,12 +546,17 @@ void RawData::unpack(
  */
 void RawData::unpack_vls128(
   const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
-  const rclcpp::Time & scan_start_time)
+  const rclcpp::Time & scan_start_time, const raw_packet & decoded)
 {
-  const raw_packet * raw = reinterpret_cast<const raw_packet *>(&pkt.data[0]);
+  const raw_packet * raw = &decoded;
+  const float time_diff_start_to_this_packet =
+    (rclcpp::Time(pkt.stamp) - scan_start_time).seconds();
 
-  bool dual_return = (pkt.data[1204] == 57);
-  for (int block = 0; block < BLOCKS_PER_PACKET - (4 * dual_return); block++) {
+  const bool dual_return = pkt.data[1204] == 57;
+  for (int index = 0; index < BLOCKS_PER_PACKET - (4 * dual_return); ++index) {
+    // Dual blocks pair each bank's returns. Group the four banks of each
+    // return into a separate organized row so neither return overwrites the other.
+    const int block = dual_return ? (index % 4) * 2 + index / 4 : index;
     // cache block for use
     const raw_block & current_block = raw->blocks[block];
 
@@ -552,6 +620,7 @@ void RawData::unpack_vls128(
           break;
       }
       azimuth_diff = static_cast<float>((36000 + azimuth_next - azimuth) % 36000);
+      azimuth = current_block.rotation;
     } else {
       // We can't calculate for dual return, since it have 1 azimuth per data packet and
       // we don't have access to the next packet.
@@ -564,10 +633,9 @@ void RawData::unpack_vls128(
       // VLS-128 fires 8 lasers at a time
       uint8_t firing_order = laser_number / 8;
 
-      float time_diff_start_to_this_packet = (rclcpp::Time(pkt.stamp) - scan_start_time).seconds();
       float time {};
       if (timing_offsets_.size()) {
-        time = timing_offsets_[block / 4][firing_order + laser_number / 64] +
+        time = timing_offsets_[dual_return ? 0 : block / 4][firing_order + laser_number / 64] +
           time_diff_start_to_this_packet;
       }
 
@@ -575,15 +643,15 @@ void RawData::unpack_vls128(
         calibration_->laser_corrections[laser_number];
 
       // distance extraction
-      union two_bytes tmp;
-      tmp.bytes[0] = current_block.data[k];
-      tmp.bytes[1] = current_block.data[k + 1];
-      float distance = tmp.uint * VLS128_DISTANCE_RESOLUTION;
+      const uint16_t raw_distance = readLittle16(current_block.data + k);
+      const float distance = raw_distance == 0 ? nanf("") :
+        raw_distance * VLS128_DISTANCE_RESOLUTION;
 
       // correct for the laser rotation as a function of timing during the firings
       float azimuth_corrected_f = azimuth +
         (azimuth_diff * vls_128_laser_azimuth_cache_[firing_order]);
-      uint16_t azimuth_corrected = ((uint16_t) round(azimuth_corrected_f)) % 36000;
+      const uint16_t azimuth_corrected =
+        static_cast<int>(std::lround(azimuth_corrected_f)) % ROTATION_MAX_UNITS;
 
       // condition added to avoid calculating points
       // which are not in the interesting defined area (min_angle < area < max_angle)
@@ -591,7 +659,9 @@ void RawData::unpack_vls128(
       if (((config_.min_angle < config_.max_angle &&
         azimuth_corrected >= config_.min_angle &&
         azimuth_corrected <= config_.max_angle) ||
-        (config_.min_angle > config_.max_angle)) &&
+        (config_.min_angle > config_.max_angle &&
+        (azimuth_corrected <= config_.max_angle ||
+        azimuth_corrected >= config_.min_angle))) &&
         pointInRange(distance))
       {
         // convert polar coordinates to Euclidean XYZ
@@ -656,7 +726,8 @@ void RawData::unpack_vls128(
  */
 void RawData::unpack_vlp16(
   const velodyne_msgs::msg::VelodynePacket & pkt, DataContainerBase & data,
-  const rclcpp::Time & scan_start_time, bool is_first_packet, bool is_last_packet)
+  const rclcpp::Time & scan_start_time, bool is_first_packet, bool is_last_packet,
+  const raw_packet & decoded)
 {
   float azimuth;
   float azimuth_diff;
@@ -670,7 +741,7 @@ void RawData::unpack_vlp16(
   float time_diff_start_to_this_packet =
     (rclcpp::Time(pkt.stamp) - scan_start_time).seconds();
 
-  const raw_packet * raw = reinterpret_cast<const raw_packet *>(&pkt.data[0]);
+  const raw_packet * raw = &decoded;
 
   const bool dual_return = pkt.data[1204] == 57;
   if (dual_return && vlp16_packet_timestamp_reference_ >= BLOCKS_PER_PACKET / 2) {
@@ -684,7 +755,7 @@ void RawData::unpack_vlp16(
   const int block_step = select_one_return ? 2 : 1;
   int boundary_block = -1;
   for (int block = 1; block < BLOCKS_PER_PACKET; ++block) {
-    if (raw->blocks[block].rotation < raw->blocks[block - 1].rotation) {
+    if (raw->blocks[block - 1].rotation - raw->blocks[block].rotation > 18000) {
       boundary_block = block;
       break;
     }
@@ -766,9 +837,7 @@ void RawData::unpack_vlp16(
         velodyne_pointcloud::LaserCorrection & corrections = calibration_->laser_corrections[dsr];
 
         /** Position Calculation */
-        union two_bytes tmp{};
-        tmp.bytes[0] = raw->blocks[block].data[k];
-        tmp.bytes[1] = raw->blocks[block].data[k + 1];
+        const uint16_t raw_distance = readLittle16(raw->blocks[block].data + k);
 
         /** correct for the laser rotation as a function of timing during the firings **/
         azimuth_corrected_f =
@@ -786,7 +855,8 @@ void RawData::unpack_vlp16(
           azimuth_corrected >= config_.min_angle)))
         {
           // convert polar coordinates to Euclidean XYZ
-          float distance = tmp.uint * calibration_->distance_resolution_m;
+          float distance = raw_distance == 0 ? nanf("") :
+            raw_distance * calibration_->distance_resolution_m;
           distance += corrections.dist_correction;
 
           float cos_vert_angle = corrections.cos_vert_correction;
@@ -881,7 +951,8 @@ void RawData::unpack_vlp16(
           float focal_offset = 256.0f * square(1.0f - corrections.focal_distance / 13100.0f);
           float focal_slope = corrections.focal_slope;
           intensity += focal_slope *
-            (std::abs(focal_offset - 256.0f * square((1.0f - distance) / 65535.0f)));
+            (std::abs(focal_offset - 256.0f *
+              square(1.0f - static_cast<float>(raw_distance) / 65535.0f)));
           intensity = (intensity < min_intensity) ? min_intensity : intensity;
           intensity = (intensity > max_intensity) ? max_intensity : intensity;
 

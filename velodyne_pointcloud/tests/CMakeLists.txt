@@ -32,3 +32,10 @@ target_link_libraries(test_vlp16_exyn
   rclcpp::rclcpp
   velodyne_rawdata
 )
+
+ament_add_gtest(test_decoding test_decoding.cpp)
+target_link_libraries(test_decoding
+  ament_index_cpp::ament_index_cpp
+  velodyne_rawdata
+  velodyne_cloud_types
+)

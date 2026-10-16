@@ -1,9 +1,11 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.16)
 project(velodyne_pointcloud)
 
-# Default to C++14
+# Default to C++17
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+  set(CMAKE_CXX_EXTENSIONS OFF)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -15,9 +17,8 @@ find_package(angles REQUIRED)
 find_package(diagnostic_updater REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(message_filters REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(tf2 REQUIRED)
@@ -31,18 +32,13 @@ find_package(yaml-cpp REQUIRED)
 if(TARGET yaml-cpp::yaml-cpp)
   set(YAML_CPP_TARGET "yaml-cpp::yaml-cpp")
 else()
-  set(YAML_CPP_TARGET ${YAML_CPP_LIBRARIES})
-endif()
-
-# Work around broken find module in AlmaLinux/RHEL eigen3-devel from PowerTools repo
-find_package(Eigen3 QUIET NO_MODULE)
-if(NOT Eigen3_FOUND)
-  find_package(Eigen3 REQUIRED)
+  set(YAML_CPP_TARGET yaml-cpp)
 endif()
 
 add_library(velodyne_rawdata SHARED
   src/lib/rawdata.cpp
   src/lib/calibration.cpp)
+target_compile_features(velodyne_rawdata PUBLIC cxx_std_17)
 target_include_directories(velodyne_rawdata PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
@@ -50,7 +46,6 @@ target_link_libraries(velodyne_rawdata PUBLIC
   angles::angles
   Eigen3::Eigen
   ${geometry_msgs_TARGETS}
-  ${PCL_LIBRARIES}
   rclcpp::rclcpp
   ${sensor_msgs_TARGETS}
   tf2::tf2
@@ -63,12 +58,12 @@ add_library(velodyne_cloud_types SHARED
   src/lib/pointcloudXYZIRT.cpp
   src/lib/organized_cloudXYZIRT.cpp
 )
+target_compile_features(velodyne_cloud_types PUBLIC cxx_std_17)
 target_include_directories(velodyne_cloud_types PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
 target_link_libraries(velodyne_cloud_types PUBLIC
   Eigen3::Eigen
-  ${PCL_LIBRARIES}
   rclcpp::rclcpp
   ${sensor_msgs_TARGETS}
   tf2_ros::tf2_ros
@@ -77,13 +72,13 @@ target_link_libraries(velodyne_cloud_types PUBLIC
 
 add_library(transform SHARED
   src/conversions/transform.cpp)
+target_compile_features(transform PUBLIC cxx_std_17)
 target_include_directories(transform PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
 target_link_libraries(transform PUBLIC
   diagnostic_updater::diagnostic_updater
   Eigen3::Eigen
-  message_filters::message_filters
   rclcpp::rclcpp
   tf2::tf2
   tf2_ros::tf2_ros
@@ -116,7 +111,7 @@ target_link_libraries(velodyne_transform_node PRIVATE
 install(TARGETS velodyne_transform_node
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY include/${PROJECT_NAME}/
+install(DIRECTORY include/
   DESTINATION include/${PROJECT_NAME})
 install(DIRECTORY config launch params
   DESTINATION share/${PROJECT_NAME})
@@ -151,26 +146,28 @@ if(BUILD_TESTING)
 
   # Files created by this fork carry recognized notices; keep them checked.
   find_package(ament_cmake_copyright REQUIRED)
-  ament_copyright(TESTNAME copyright_fork tests/test_vlp16_exyn.cpp)
+  ament_copyright(TESTNAME copyright_fork
+    tests/test_vlp16_exyn.cpp tests/test_decoding.cpp tests/test_utils.hpp)
 
   add_subdirectory(tests)
 endif()
 
 ament_export_include_directories(include/${PROJECT_NAME})
 ament_export_dependencies(
+  angles
   diagnostic_updater
-  eigen
+  Eigen3
   geometry_msgs
-  message_filters
-  pcl
   rclcpp
+  rcl_interfaces
   sensor_msgs
   tf2
   tf2_ros
   velodyne_msgs
+  yaml_cpp_vendor
   yaml-cpp
 )
 ament_export_libraries(velodyne_rawdata velodyne_cloud_types)
-ament_export_targets(${PROJECT_NAME})
+ament_export_targets(${PROJECT_NAME} HAS_LIBRARY_TARGET)
 
 ament_package()

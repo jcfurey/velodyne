@@ -40,14 +40,15 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <rcl_interfaces/msg/floating_point_range.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
-#include <tf2_ros/transform_listener.hpp>
 #include <velodyne_msgs/msg/velodyne_scan.hpp>
 
 namespace velodyne_driver
@@ -57,8 +58,11 @@ VelodyneDriver::VelodyneDriver(const rclcpp::NodeOptions & options)
 : rclcpp::Node("velodyne_driver_node", options),
   diagnostics_(this, 0.2)
 {
-  std::string devip = this->declare_parameter("device_ip", std::string(""));
-  bool gps_time = this->declare_parameter("gps_time", false);
+  rcl_interfaces::msg::ParameterDescriptor startup;
+  startup.read_only = true;
+
+  std::string devip = this->declare_parameter("device_ip", std::string(""), startup);
+  bool gps_time = this->declare_parameter("gps_time", false, startup);
 
   rcl_interfaces::msg::ParameterDescriptor offset_desc;
   offset_desc.name = "time_offset";
@@ -68,23 +72,38 @@ VelodyneDriver::VelodyneDriver(const rclcpp::NodeOptions & options)
   offset_range.from_value = -1.0;
   offset_range.to_value = 1.0;
   offset_desc.floating_point_range.push_back(offset_range);
-  config_.time_offset = this->declare_parameter("time_offset", 0.0, offset_desc);
+  const double initial_offset = this->declare_parameter("time_offset", 0.0, offset_desc);
+  if (!std::isfinite(initial_offset)) {
+    throw std::invalid_argument("time_offset must be finite");
+  }
+  parameter_callback_ = add_on_set_parameters_callback(
+    [](const std::vector<rclcpp::Parameter> & parameters) {
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      for (const auto & parameter : parameters) {
+        if (parameter.get_name() == "time_offset" &&
+        (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE ||
+        !std::isfinite(parameter.as_double())))
+        {
+          result.successful = false;
+          result.reason = "time_offset must be a finite double";
+        }
+      }
+      return result;
+    });
 
-  config_.enabled.store(this->declare_parameter("enabled", true));
-  bool read_once = this->declare_parameter("read_once", false);
-  bool read_fast = this->declare_parameter("read_fast", false);
-  double repeat_delay = this->declare_parameter("repeat_delay", 0.0);
-  config_.frame_id = this->declare_parameter("frame_id", std::string("velodyne"));
-  config_.model = this->declare_parameter("model", std::string("64E"));
-  config_.rpm = this->declare_parameter("rpm", 600.0);
-  std::string dump_file = this->declare_parameter("pcap", std::string(""));
-  double cut_angle = this->declare_parameter("cut_angle", -1.0);
-  int udp_port = this->declare_parameter("port", static_cast<int>(DATA_PORT_NUMBER));
-  config_.timestamp_first_packet = this->declare_parameter("timestamp_first_packet", false);
-
-  param_subscriber_ = std::make_shared<rclcpp::ParameterEventHandler>(this);
-  param_enabled_cb_handle_ = param_subscriber_->add_parameter_callback(
-    "enabled", [this](const rclcpp::Parameter & p) {this->config_.enabled.store(p.as_bool());});
+  this->declare_parameter("enabled", true);
+  bool read_once = this->declare_parameter("read_once", false, startup);
+  bool read_fast = this->declare_parameter("read_fast", false, startup);
+  double repeat_delay = this->declare_parameter("repeat_delay", 0.0, startup);
+  config_.frame_id = this->declare_parameter("frame_id", std::string("velodyne"), startup);
+  config_.model = this->declare_parameter("model", std::string("64E"), startup);
+  config_.rpm = this->declare_parameter("rpm", 600.0, startup);
+  std::string dump_file = this->declare_parameter("pcap", std::string(""), startup);
+  double cut_angle = this->declare_parameter("cut_angle", -1.0, startup);
+  int udp_port = this->declare_parameter("port", static_cast<int>(DATA_PORT_NUMBER), startup);
+  config_.timestamp_first_packet = this->declare_parameter("timestamp_first_packet", false,
+      startup);
 
   future_ = exit_signal_.get_future();
 
@@ -123,24 +142,30 @@ VelodyneDriver::VelodyneDriver(const rclcpp::NodeOptions & options)
   std::string deviceName(std::string("Velodyne ") + model_full_name);
 
   RCLCPP_INFO(this->get_logger(), "%s rotating at %f RPM", deviceName.c_str(), config_.rpm);
+  if (!std::isfinite(config_.rpm) || config_.rpm <= 0.0 ||
+    !std::isfinite(repeat_delay) || repeat_delay < 0.0 || repeat_delay > 86400.0 ||
+    !std::isfinite(cut_angle) || cut_angle > 2.0 * M_PI ||
+    udp_port < 1 || udp_port > 65535)
+  {
+    throw std::invalid_argument("Invalid rpm, repeat_delay, cut_angle, or port");
+  }
   double frequency = (config_.rpm / 60.0);     // expected Hz rate
 
   // default number of packets for each scan is a single revolution
   // (fractions rounded up)
-  config_.npackets = static_cast<int>(std::ceil(packet_rate / frequency));
+  const double packets_per_scan = std::ceil(packet_rate / frequency);
+  if (packets_per_scan > 100000.0) {
+    throw std::invalid_argument("rpm would require more than 100000 packets per scan");
+  }
+  config_.npackets = static_cast<int>(packets_per_scan);
   RCLCPP_INFO(this->get_logger(), "publishing %d packets per scan", config_.npackets);
 
   if (cut_angle < 0.0) {
     RCLCPP_INFO(this->get_logger(), "Cut at specific angle feature deactivated.");
-  } else if (cut_angle <= (2.0 * M_PI)) {
+  } else {
     RCLCPP_INFO(
       this->get_logger(), "Cut at specific angle feature activated. "
       "Cutting velodyne points always at %f rad.", cut_angle);
-  } else {
-    RCLCPP_ERROR(
-      this->get_logger(), "cut_angle parameter is out of range."
-      "Allowed range is between 0.0 and 2*PI or negative values to deactivate this feature.");
-    cut_angle = -0.01;
   }
 
   // if we are timestamping based on the first or last packet in the scan
@@ -152,7 +177,8 @@ VelodyneDriver::VelodyneDriver(const rclcpp::NodeOptions & options)
 
   // Convert cut_angle from radian to one-hundredth degree,
   // which is used in velodyne packets
-  config_.cut_angle = static_cast<int>((cut_angle * 360 / (2 * M_PI)) * 100);
+  config_.cut_angle = cut_angle < 0.0 ? -1 :
+    static_cast<int>(cut_angle * 18000.0 / M_PI) % 36000;
 
   // initialize diagnostics
   diagnostics_.setHardwareID(deviceName);
@@ -179,8 +205,11 @@ VelodyneDriver::VelodyneDriver(const rclcpp::NodeOptions & options)
   }
 
   // raw packet output topic
-  output_ =
-    this->create_publisher<velodyne_msgs::msg::VelodyneScan>("velodyne_packets", 10);
+  rclcpp::PublisherOptions publisher_options;
+  publisher_options.qos_overriding_options =
+    rclcpp::QosOverridingOptions::with_default_policies();
+  output_ = this->create_publisher<velodyne_msgs::msg::VelodyneScan>(
+    "velodyne_packets", rclcpp::QoS(10), publisher_options);
 
   last_azimuth_ = -1;
 
@@ -190,7 +219,10 @@ VelodyneDriver::VelodyneDriver(const rclcpp::NodeOptions & options)
 VelodyneDriver::~VelodyneDriver()
 {
   exit_signal_.set_value();
-  poll_thread_.join();
+  input_->requestStop();
+  if (poll_thread_.joinable()) {
+    poll_thread_.join();
+  }
 }
 
 /** poll the device
@@ -199,12 +231,14 @@ VelodyneDriver::~VelodyneDriver()
  */
 bool VelodyneDriver::poll()
 {
-  if (!config_.enabled.load()) {
+  if (!get_parameter("enabled").as_bool()) {
     // If we are not enabled exit once a second to let the caller handle
     // anything it might need to, such as if it needs to exit.
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    future_.wait_for(std::chrono::milliseconds(100));
     return true;
   }
+
+  const double time_offset = get_parameter("time_offset").as_double();
 
   // Allocate a new unique pointer for zero-copy sharing with other nodes.
   std::unique_ptr<velodyne_msgs::msg::VelodyneScan> scan =
@@ -216,7 +250,10 @@ bool VelodyneDriver::poll()
 
     while (true) {
       while (true) {
-        int rc = input_->getPacket(&tmp_packet, config_.time_offset);
+        if (stopping()) {
+          return false;
+        }
+        int rc = input_->getPacket(&tmp_packet, time_offset);
         if (rc == 0) {  // got a full packet?
           break;
         }
@@ -228,9 +265,18 @@ bool VelodyneDriver::poll()
 
       scan->packets.push_back(tmp_packet);
 
-      // Extract base rotation of first block in packet
-      size_t azimuth_data_pos = 100 * 0 + 2;
-      int azimuth = *(reinterpret_cast<uint16_t *>(&tmp_packet.data[azimuth_data_pos]));
+      // Packet azimuth is little-endian and may not be aligned.
+      const int azimuth = static_cast<int>(tmp_packet.data[2]) |
+        (static_cast<int>(tmp_packet.data[3]) << 8);
+      if (azimuth >= 36000) {
+        scan->packets.pop_back();
+        continue;
+      }
+      if (scan->packets.size() >= static_cast<size_t>(config_.npackets) * 6) {
+        RCLCPP_WARN(get_logger(), "Cut angle not reached; discarding oversized scan");
+        last_azimuth_ = -1;
+        return true;
+      }
 
       // if first packet in scan, there is no "valid" last_azimuth_
       if (last_azimuth_ == -1) {
@@ -253,11 +299,19 @@ bool VelodyneDriver::poll()
     // reading and publishing scans as fast as possible.
     scan->packets.resize(config_.npackets);
 
-    for (int i = 0; i < config_.npackets; ++i) {
+    for (size_t i = 0; i < scan->packets.size(); ++i) {
       while (true) {
+        if (stopping()) {
+          return false;
+        }
         // keep reading until full packet received
-        int rc = input_->getPacket(&scan->packets[i], config_.time_offset);
+        int rc = input_->getPacket(&scan->packets[i], time_offset);
         if (rc == 0) {  // got a full packet?
+          if (i == 0 && scan->packets[0].data[1204] == 57) {
+            const int multiplier = config_.model == "VLS128" ? 3 :
+              (config_.model == "VLP16" || config_.model == "32C") ? 2 : 1;
+            scan->packets.resize(static_cast<size_t>(config_.npackets) * multiplier);
+          }
           break;
         }
 
@@ -283,14 +337,20 @@ bool VelodyneDriver::poll()
   return true;
 }
 
+bool VelodyneDriver::stopping()
+{
+  return future_.wait_for(std::chrono::seconds(0)) != std::future_status::timeout ||
+         !rclcpp::ok(get_node_base_interface()->get_context());
+}
+
 void VelodyneDriver::pollThread()
 {
-  std::future_status status;
-
-  do {
-    poll();
-    status = future_.wait_for(std::chrono::seconds(0));
-  } while (status == std::future_status::timeout);
+  try {
+    while (!stopping() && poll()) {
+    }
+  } catch (const std::exception & error) {
+    RCLCPP_ERROR(get_logger(), "Velodyne polling stopped: %s", error.what());
+  }
 }
 
 }  // namespace velodyne_driver

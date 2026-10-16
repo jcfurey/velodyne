@@ -40,6 +40,10 @@
 namespace velodyne_laserscan
 {
 
+// Throws std::invalid_argument for malformed clouds or invalid configuration.
+sensor_msgs::msg::LaserScan pointCloudToLaserScan(
+  const sensor_msgs::msg::PointCloud2 & cloud, int ring, double resolution);
+
 class VelodyneLaserScan final
   : public rclcpp::Node
 {
@@ -52,12 +56,11 @@ public:
   VelodyneLaserScan & operator=(const VelodyneLaserScan & c) = delete;
 
 private:
-  void recvCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
+  void recvCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr pub_;
 
-  uint16_t ring_count_{0};
   int ring_;
   double resolution_;
 };

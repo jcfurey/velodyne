@@ -25,8 +25,8 @@
   <depend>diagnostic_updater</depend>
   <depend>libpcap</depend>
   <depend>rclcpp</depend>
+  <depend>rcl_interfaces</depend>
   <depend>rclcpp_components</depend>
-  <depend>tf2_ros</depend>
   <depend>velodyne_msgs</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>

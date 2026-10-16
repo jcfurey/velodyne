@@ -33,9 +33,9 @@
 #include <memory>
 #include <string>
 
+#include <cstring>
+
 #include <sensor_msgs/msg/point_field.hpp>
-#include <tf2/buffer_core.hpp>
-#include <velodyne_msgs/msg/velodyne_scan.hpp>
 
 #include "velodyne_pointcloud/pointcloudXYZIRT.hpp"
 
@@ -54,20 +54,12 @@ PointcloudXYZIRT::PointcloudXYZIRT(
     "z", 1, sensor_msgs::msg::PointField::FLOAT32,
     "intensity", 1, sensor_msgs::msg::PointField::FLOAT32,
     "ring", 1, sensor_msgs::msg::PointField::UINT16,
-    "time", 1, sensor_msgs::msg::PointField::FLOAT32),
-  iter_x_(cloud, "x"), iter_y_(cloud, "y"), iter_z_(cloud, "z"),
-  iter_intensity_(cloud, "intensity"), iter_ring_(cloud, "ring"), iter_time_(cloud, "time")
+    "time", 1, sensor_msgs::msg::PointField::FLOAT32)
 {}
 
 void PointcloudXYZIRT::setup(const velodyne_msgs::msg::VelodyneScan::ConstSharedPtr scan_msg)
 {
   DataContainerBase::setup(scan_msg);
-  iter_x_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "x");
-  iter_y_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "y");
-  iter_z_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "z");
-  iter_intensity_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "intensity");
-  iter_ring_ = sensor_msgs::PointCloud2Iterator<uint16_t>(cloud, "ring");
-  iter_time_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "time");
 }
 
 void PointcloudXYZIRT::newLine()
@@ -81,25 +73,20 @@ void PointcloudXYZIRT::addPoint(
   if (!pointInRange(distance)) {
     return;
   }
-
-  // convert polar coordinates to Euclidean XYZ
-
+  const size_t offset = static_cast<size_t>(cloud.width) * cloud.point_step;
+  if (offset + cloud.point_step > cloud.data.size()) {
+    throw std::length_error("Decoded points exceed scan capacity");
+  }
   transformPoint(x, y, z);
-
-  *iter_x_ = x;
-  *iter_y_ = y;
-  *iter_z_ = z;
-  *iter_ring_ = ring;
-  *iter_intensity_ = intensity;
-  *iter_time_ = time;
-
+  // Preserve the packed 22-byte XYZIRT schema without unaligned typed accesses.
+  auto * point = cloud.data.data() + offset;
+  std::memcpy(point, &x, sizeof(x));
+  std::memcpy(point + 4, &y, sizeof(y));
+  std::memcpy(point + 8, &z, sizeof(z));
+  std::memcpy(point + 12, &intensity, sizeof(intensity));
+  std::memcpy(point + 16, &ring, sizeof(ring));
+  std::memcpy(point + 18, &time, sizeof(time));
   ++cloud.width;
-  ++iter_x_;
-  ++iter_y_;
-  ++iter_z_;
-  ++iter_ring_;
-  ++iter_intensity_;
-  ++iter_time_;
 }
 
 }  // namespace velodyne_pointcloud

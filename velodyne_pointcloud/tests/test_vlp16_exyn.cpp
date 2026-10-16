@@ -40,7 +40,7 @@
 #include <string>
 #include <vector>
 
-#include <ament_index_cpp/get_package_prefix.hpp>
+#include "test_utils.hpp"
 
 #include "velodyne_pointcloud/calibration.hpp"
 #include "velodyne_pointcloud/datacontainerbase.hpp"
@@ -130,9 +130,7 @@ velodyne_msgs::msg::VelodynePacket makeDualPacket(
 
 std::filesystem::path calibrationPath()
 {
-  std::filesystem::path package_prefix;
-  ament_index_cpp::get_package_prefix("velodyne_pointcloud", package_prefix);
-  return package_prefix / "share/velodyne_pointcloud/params/VLP16db.yaml";
+  return velodyne_test::packageSharePath() / "params/VLP16db.yaml";
 }
 
 std::unique_ptr<velodyne_rawdata::RawData> makeDefaultDecoder()

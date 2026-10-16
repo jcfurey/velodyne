@@ -32,230 +32,185 @@
 
 #include "velodyne_laserscan/velodyne_laserscan.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 #include <rcl_interfaces/msg/floating_point_range.hpp>
 #include <rcl_interfaces/msg/integer_range.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
-#include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
-#include <sensor_msgs/msg/laser_scan.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
 
 namespace velodyne_laserscan
 {
+namespace
+{
+template<typename T>
+T readField(const uint8_t * source, bool swap_bytes)
+{
+  T value;
+  if (swap_bytes) {
+    uint8_t bytes[sizeof(T)];
+    std::reverse_copy(source, source + sizeof(T), bytes);
+    std::memcpy(&value, bytes, sizeof(value));
+  } else {
+    std::memcpy(&value, source, sizeof(value));
+  }
+  return value;
+}
+
+int fieldOffset(
+  const sensor_msgs::msg::PointCloud2 & cloud, const char * name, uint8_t type, size_t size)
+{
+  for (const auto & field : cloud.fields) {
+    if (field.name == name) {
+      if (field.datatype != type || field.count != 1 || field.offset > cloud.point_step ||
+        size > cloud.point_step - field.offset ||
+        field.offset > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+      {
+        throw std::invalid_argument("Invalid PointCloud2 field layout");
+      }
+      return static_cast<int>(field.offset);
+    }
+  }
+  return -1;
+}
+}  // namespace
+
+sensor_msgs::msg::LaserScan pointCloudToLaserScan(
+  const sensor_msgs::msg::PointCloud2 & cloud, int selected_ring, double resolution)
+{
+  if (!std::isfinite(resolution) || resolution < 0.001 || resolution > 0.05 ||
+    selected_ring < -1 || selected_ring > 127)
+  {
+    throw std::invalid_argument("Invalid ring or angular resolution");
+  }
+  const int offset_x = fieldOffset(cloud, "x", sensor_msgs::msg::PointField::FLOAT32, 4);
+  const int offset_y = fieldOffset(cloud, "y", sensor_msgs::msg::PointField::FLOAT32, 4);
+  const int offset_r = fieldOffset(cloud, "ring", sensor_msgs::msg::PointField::UINT16, 2);
+  const int offset_i = fieldOffset(cloud, "intensity", sensor_msgs::msg::PointField::FLOAT32, 4);
+  if (offset_x < 0 || offset_y < 0 || offset_r < 0 || cloud.point_step == 0 ||
+    static_cast<uint64_t>(cloud.width) * cloud.point_step > cloud.row_step ||
+    static_cast<uint64_t>(cloud.height) * cloud.row_step > cloud.data.size())
+  {
+    throw std::invalid_argument("PointCloud2 missing required fields or truncated data");
+  }
+  const uint16_t endian_probe = 1;
+  const bool host_big_endian = *reinterpret_cast<const uint8_t *>(&endian_probe) == 0;
+  const bool swap_bytes = cloud.is_bigendian != host_big_endian;
+  if (selected_ring < 0) {
+    uint32_t ring_count = 0;
+    for (uint32_t row = 0; row < cloud.height; ++row) {
+      const auto * point = cloud.data.data() + static_cast<size_t>(row) * cloud.row_step;
+      for (uint32_t column = 0; column < cloud.width; ++column, point += cloud.point_step) {
+        ring_count = std::max(
+          ring_count, static_cast<uint32_t>(readField<uint16_t>(point + offset_r, swap_bytes)) + 1);
+      }
+    }
+    selected_ring = ring_count > 64 ? 71 : ring_count > 32 ? 57 : ring_count > 16 ? 23 : 8;
+    if (ring_count && static_cast<uint32_t>(selected_ring) >= ring_count) {
+      selected_ring = ring_count / 2;
+    }
+  }
+  sensor_msgs::msg::LaserScan scan;
+  scan.header = cloud.header;
+  scan.angle_increment = static_cast<float>(resolution);
+  scan.angle_min = -static_cast<float>(M_PI);
+  // Use the published float increment for indexing and metadata alike.
+  const size_t bins = static_cast<size_t>(std::ceil(2.0 * M_PI / scan.angle_increment));
+  scan.angle_max = scan.angle_min + (bins - 1) * scan.angle_increment;
+  scan.range_min = 0.0f;
+  scan.range_max = 200.0f;
+  scan.ranges.assign(bins, std::numeric_limits<float>::infinity());
+  if (offset_i >= 0) {
+    scan.intensities.resize(bins);
+  }
+  for (uint32_t row = 0; row < cloud.height; ++row) {
+    const auto * point = cloud.data.data() + static_cast<size_t>(row) * cloud.row_step;
+    for (uint32_t column = 0; column < cloud.width; ++column, point += cloud.point_step) {
+      if (readField<uint16_t>(point + offset_r, swap_bytes) != selected_ring) {
+        continue;
+      }
+      const float x = readField<float>(point + offset_x, swap_bytes);
+      const float y = readField<float>(point + offset_y, swap_bytes);
+      if (!std::isfinite(x) || !std::isfinite(y)) {
+        continue;
+      }
+      const float range = std::hypot(x, y);
+      if (range <= scan.range_min || range > scan.range_max) {
+        continue;
+      }
+      double angle = std::atan2(y, x) + M_PI;
+      if (angle >= 2.0 * M_PI) {
+        angle = 0.0;
+      }
+      const size_t bin = static_cast<size_t>(angle / scan.angle_increment);
+      if (bin < bins && range < scan.ranges[bin]) {
+        scan.ranges[bin] = range;
+        if (offset_i >= 0) {
+          scan.intensities[bin] = readField<float>(point + offset_i, swap_bytes);
+        }
+      }
+    }
+  }
+  return scan;
+}
 
 VelodyneLaserScan::VelodyneLaserScan(const rclcpp::NodeOptions & options)
 : rclcpp::Node("velodyne_laserscan_node", options)
 {
   rcl_interfaces::msg::ParameterDescriptor ring_desc;
-  ring_desc.name = "ring";
-  ring_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_INTEGER;
-  ring_desc.description = "Ring";
+  ring_desc.read_only = true;
+  ring_desc.description = "Laser ring, or -1 to select a default based on the cloud";
   rcl_interfaces::msg::IntegerRange ring_range;
   ring_range.from_value = -1;
-  ring_range.to_value = 31;
+  ring_range.to_value = 127;
   ring_desc.integer_range.push_back(ring_range);
   ring_ = declare_parameter("ring", -1, ring_desc);
 
   rcl_interfaces::msg::ParameterDescriptor resolution_desc;
-  resolution_desc.name = "resolution";
-  resolution_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE;
-  resolution_desc.description = "Resolution";
+  resolution_desc.read_only = true;
+  resolution_desc.description = "Angular resolution in radians";
   rcl_interfaces::msg::FloatingPointRange resolution_range;
   resolution_range.from_value = 0.001;
   resolution_range.to_value = 0.05;
   resolution_desc.floating_point_range.push_back(resolution_range);
   resolution_ = declare_parameter("resolution", 0.007, resolution_desc);
+  if (!std::isfinite(resolution_)) {
+    throw std::invalid_argument("resolution must be finite");
+  }
 
+  rclcpp::SubscriptionOptions subscription_options;
+  subscription_options.qos_overriding_options =
+    rclcpp::QosOverridingOptions::with_default_policies();
   sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    "velodyne_points", rclcpp::QoS(10),
-    std::bind(&VelodyneLaserScan::recvCallback, this, std::placeholders::_1));
-  pub_ = this->create_publisher<sensor_msgs::msg::LaserScan>("scan", 10);
+    "velodyne_points", rclcpp::SensorDataQoS(),
+    std::bind(&VelodyneLaserScan::recvCallback, this, std::placeholders::_1), subscription_options);
+  rclcpp::PublisherOptions publisher_options;
+  publisher_options.qos_overriding_options =
+    rclcpp::QosOverridingOptions::with_default_policies();
+  pub_ = this->create_publisher<sensor_msgs::msg::LaserScan>(
+    "scan", rclcpp::QoS(10), publisher_options);
 }
 
-void VelodyneLaserScan::recvCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+void VelodyneLaserScan::recvCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
-  // Latch ring count
-  if (!ring_count_) {
-    // Check for PointCloud2 field 'ring'
-    bool found = false;
-    for (size_t i = 0; i < msg->fields.size(); i++) {
-      if (msg->fields[i].datatype == sensor_msgs::msg::PointField::UINT16) {
-        if (msg->fields[i].name == "ring") {
-          found = true;
-          break;
-        }
-      }
-    }
-
-    if (!found) {
-      RCLCPP_ERROR(this->get_logger(), "Field 'ring' of type 'UINT16' not present in PointCloud2");
-      return;
-    }
-
-    for (sensor_msgs::PointCloud2ConstIterator<uint16_t> it(*msg, "ring"); it != it.end(); ++it) {
-      const uint16_t ring = *it;
-
-      if (ring + 1 > ring_count_) {
-        ring_count_ = ring + 1;
-      }
-    }
-
-    if (ring_count_) {
-      RCLCPP_INFO(this->get_logger(), "Latched ring count of %u", ring_count_);
-    } else {
-      RCLCPP_ERROR(this->get_logger(), "Field 'ring' of type 'UINT16' not present in PointCloud2");
-      return;
-    }
+  if (pub_->get_subscription_count() == 0 && pub_->get_intra_process_subscription_count() == 0) {
+    return;
   }
-
-  // Select ring to use
-  uint16_t ring;
-
-  if ((ring_ < 0) || (ring_ >= ring_count_)) {
-    // Default to ring closest to being level for each known sensor
-    if (ring_count_ > 32) {
-      ring = 57;  // HDL-64E
-    } else if (ring_count_ > 16) {
-      ring = 23;  // HDL-32E
-    } else {
-      ring = 8;  // VLP-16
-    }
-  } else {
-    ring = ring_;
-  }
-
-  // Load structure of PointCloud2
-  int offset_x = -1;
-  int offset_y = -1;
-  int offset_z = -1;
-  int offset_i = -1;
-  int offset_r = -1;
-
-  for (size_t i = 0; i < msg->fields.size(); i++) {
-    if (msg->fields[i].datatype == sensor_msgs::msg::PointField::FLOAT32) {
-      if (msg->fields[i].name == "x") {
-        offset_x = msg->fields[i].offset;
-      } else if (msg->fields[i].name == "y") {
-        offset_y = msg->fields[i].offset;
-      } else if (msg->fields[i].name == "z") {
-        offset_z = msg->fields[i].offset;
-      } else if (msg->fields[i].name == "intensity") {
-        offset_i = msg->fields[i].offset;
-      }
-    } else if (msg->fields[i].datatype == sensor_msgs::msg::PointField::UINT16) {
-      if (msg->fields[i].name == "ring") {
-        offset_r = msg->fields[i].offset;
-      }
-    }
-  }
-
-  (void)offset_z;
-
-  // Construct LaserScan message
-  if ((offset_x >= 0) && (offset_y >= 0) && (offset_r >= 0)) {
-    const float kResolution = std::abs(resolution_);
-    const size_t kSize = std::round(2.0 * M_PI / kResolution);
-    auto scan = std::make_unique<sensor_msgs::msg::LaserScan>();
-    scan->header = msg->header;
-    scan->angle_increment = kResolution;
-    scan->angle_min = -M_PI;
-    scan->angle_max = M_PI;
-    scan->range_min = 0.0;
-    scan->range_max = 200.0;
-    scan->time_increment = 0.0;
-    scan->ranges.resize(kSize, INFINITY);
-
-    if ((offset_x == 0) &&
-      (offset_y == 4) &&
-      (offset_i % 4 == 0) &&
-      (offset_r % 4 == 0))
-    {
-      scan->intensities.resize(kSize);
-
-      const size_t X = 0;
-      const size_t Y = 1;
-      const size_t I = offset_i / 4;
-      const size_t R = offset_r / 4;
-      for (sensor_msgs::PointCloud2ConstIterator<float> it(*msg, "x"); it != it.end(); ++it) {
-        // Field "ring" is of UINT16 type, 2 bytes long. But this loop's iterator assumes FLOAT32
-        // type fields, 4 bytes long. Thus, de-referencing it (even) at the right offset will
-        // only yield "ring" field bytes, plus 2 bytes right after it, interpreted as a float
-        // value. We can, however, re-interpret that float value binary representation as that
-        // of an unsigned integer, 16 bit long.
-        const uint16_t r = *(reinterpret_cast<const uint16_t *>(&it[R]));
-
-        if (r == ring) {
-          const float x = it[X];  // x
-          const float y = it[Y];  // y
-          const float i = it[I];  // intensity
-          const int bin = (::atan2f(y, x) + static_cast<float>(M_PI)) / kResolution;
-
-          if ((bin >= 0) && (bin < static_cast<int>(kSize))) {
-            scan->ranges[bin] = ::sqrtf(x * x + y * y);
-            scan->intensities[bin] = i;
-          }
-        }
-      }
-    } else {
-      RCLCPP_WARN_ONCE(
-        get_logger(),
-        "PointCloud2 fields in unexpected order. Using slower generic method.");
-
-      if (offset_i >= 0) {
-        scan->intensities.resize(kSize);
-        sensor_msgs::PointCloud2ConstIterator<uint16_t> iter_r(*msg, "ring");
-        sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
-        sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
-        sensor_msgs::PointCloud2ConstIterator<float> iter_i(*msg, "intensity");
-
-        for (; iter_r != iter_r.end(); ++iter_x, ++iter_y, ++iter_r, ++iter_i) {
-          const uint16_t r = *iter_r;  // ring
-
-          if (r == ring) {
-            const float x = *iter_x;  // x
-            const float y = *iter_y;  // y
-            const float i = *iter_i;  // intensity
-            const int bin = (::atan2f(y, x) + static_cast<float>(M_PI)) / kResolution;
-
-            if ((bin >= 0) && (bin < static_cast<int>(kSize))) {
-              scan->ranges[bin] = ::sqrtf(x * x + y * y);
-              scan->intensities[bin] = i;
-            }
-          }
-        }
-      } else {
-        sensor_msgs::PointCloud2ConstIterator<uint16_t> iter_r(*msg, "ring");
-        sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
-        sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
-
-        for (; iter_r != iter_r.end(); ++iter_x, ++iter_y, ++iter_r) {
-          const uint16_t r = *iter_r;  // ring
-
-          if (r == ring) {
-            const float x = *iter_x;  // x
-            const float y = *iter_y;  // y
-            const int bin = (::atan2f(y, x) + static_cast<float>(M_PI)) / kResolution;
-
-            if ((bin >= 0) && (bin < static_cast<int>(kSize))) {
-              scan->ranges[bin] = ::sqrtf(x * x + y * y);
-            }
-          }
-        }
-      }
-    }
-
+  try {
+    auto scan = std::make_unique<sensor_msgs::msg::LaserScan>(
+      pointCloudToLaserScan(*msg, ring_, resolution_));
     pub_->publish(std::move(scan));
-  } else {
-    RCLCPP_ERROR(
-      this->get_logger(),
-      "PointCloud2 missing one or more required fields! (x,y,ring)");
+  } catch (const std::invalid_argument & error) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "%s", error.what());
   }
 }
 

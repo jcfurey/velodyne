@@ -13,5 +13,10 @@ Subscribed Topics
 
 Parameters
 ----------
-* `ring` (int) - The "ring" of the Velodyne to use for the single line.  If less than 0, a default ring per device will be used.  Defaults to -1.
-* `resolution` (double) - The resolution in meters that each point provides.  Defaults to 0.007.
+* `ring` (int) - The "ring" of the Velodyne to use for the single line.  Accepts -1 through 127. If -1, a default ring per device will be used.  Defaults to -1.
+* `resolution` (double) - The angular bin width in radians.  Defaults to 0.007.
+
+Configuration is read-only after startup. The subscription uses sensor-data QoS;
+publication defaults to reliable QoS. Both support reliability, history, and depth
+overrides as described in the repository README. When multiple points occupy a
+bin, the nearest valid range and its intensity are published.

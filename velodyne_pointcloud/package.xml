@@ -21,9 +21,8 @@
   <depend>diagnostic_updater</depend>
   <depend>eigen</depend>
   <depend>geometry_msgs</depend>
-  <depend>libpcl-all-dev</depend>
-  <depend>message_filters</depend>
   <depend>rclcpp</depend>
+  <depend>rcl_interfaces</depend>
   <depend>rclcpp_components</depend>
   <depend>sensor_msgs</depend>
   <depend>tf2</depend>

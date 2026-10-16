@@ -32,11 +32,11 @@
 
 #include <cmath>
 #include <memory>
+#include <cstring>
+#include <limits>
 #include <string>
 
 #include <sensor_msgs/msg/point_field.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
-#include <tf2/buffer_core.hpp>
 
 #include "velodyne_pointcloud/organized_cloudXYZIRT.hpp"
 
@@ -50,67 +50,67 @@ OrganizedCloudXYZIRT::OrganizedCloudXYZIRT(
   rclcpp::Clock::SharedPtr clock)
 : DataContainerBase(
     min_range, max_range, target_frame, fixed_frame,
-    num_lasers, 0, false, scans_per_block, clock, 6,
+    num_lasers, 0, false, num_lasers == 64 ? 2 * scans_per_block : scans_per_block, clock, 6,
     "x", 1, sensor_msgs::msg::PointField::FLOAT32,
     "y", 1, sensor_msgs::msg::PointField::FLOAT32,
     "z", 1, sensor_msgs::msg::PointField::FLOAT32,
     "intensity", 1, sensor_msgs::msg::PointField::FLOAT32,
     "ring", 1, sensor_msgs::msg::PointField::UINT16,
-    "time", 1, sensor_msgs::msg::PointField::FLOAT32),
-  iter_x_(cloud, "x"), iter_y_(cloud, "y"), iter_z_(cloud, "z"),
-  iter_intensity_(cloud, "intensity"), iter_ring_(cloud, "ring"), iter_time_(cloud, "time")
+    "time", 1, sensor_msgs::msg::PointField::FLOAT32)
 {
+  if (num_lasers == 0 || num_lasers > 128) {
+    throw std::invalid_argument("Invalid organized cloud laser count");
+  }
 }
 
 void OrganizedCloudXYZIRT::newLine()
 {
-  iter_x_ = iter_x_ + config_.init_width;
-  iter_y_ = iter_y_ + config_.init_width;
-  iter_z_ = iter_z_ + config_.init_width;
-  iter_ring_ = iter_ring_ + config_.init_width;
-  iter_intensity_ = iter_intensity_ + config_.init_width;
-  iter_time_ = iter_time_ + config_.init_width;
+  if ((static_cast<size_t>(cloud.height) + 1) * cloud.row_step > cloud.data.size()) {
+    throw std::length_error("Decoded rows exceed scan capacity");
+  }
   ++cloud.height;
 }
 
 void OrganizedCloudXYZIRT::setup(const velodyne_msgs::msg::VelodyneScan::ConstSharedPtr scan_msg)
 {
   DataContainerBase::setup(scan_msg);
-  iter_x_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "x");
-  iter_y_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "y");
-  iter_z_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "z");
-  iter_intensity_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "intensity");
-  iter_ring_ = sensor_msgs::PointCloud2Iterator<uint16_t>(cloud, "ring");
-  iter_time_ = sensor_msgs::PointCloud2Iterator<float>(cloud, "time");
+  // View filtering can skip individual rings. All missing slots must be NaN,
+  // including their time, rather than appearing as valid points at the origin.
+  const float missing = std::numeric_limits<float>::quiet_NaN();
+  for (size_t offset = 0; offset < cloud.data.size(); offset += cloud.point_step) {
+    auto * point = cloud.data.data() + offset;
+    const uint16_t ring = (offset / cloud.point_step) % cloud.width;
+    std::memcpy(point, &missing, sizeof(missing));
+    std::memcpy(point + 4, &missing, sizeof(missing));
+    std::memcpy(point + 8, &missing, sizeof(missing));
+    std::memcpy(point + 12, &missing, sizeof(missing));
+    std::memcpy(point + 16, &ring, sizeof(ring));
+    std::memcpy(point + 18, &missing, sizeof(missing));
+  }
 }
 
 void OrganizedCloudXYZIRT::addPoint(
   float x, float y, float z, const uint16_t ring,
   const float distance, const float intensity, const float time)
 {
-  /** The laser values are not ordered, the organized structure
-   * needs ordered neighbour points. The right order is defined
-   * by the laser_ring value.
-   * To keep the right ordering, the filtered values are set to
-   * NaN.
-   */
+  const size_t offset = (static_cast<size_t>(cloud.height) * cloud.width + ring) *
+    cloud.point_step;
+  if (ring >= cloud.width || offset + cloud.point_step > cloud.data.size()) {
+    throw std::out_of_range("Decoded ring exceeds organized cloud capacity");
+  }
+  float output_intensity = intensity;
   if (pointInRange(distance)) {
     transformPoint(x, y, z);
-
-    *(iter_x_ + ring) = x;
-    *(iter_y_ + ring) = y;
-    *(iter_z_ + ring) = z;
-    *(iter_intensity_ + ring) = intensity;
-    *(iter_ring_ + ring) = ring;
-    *(iter_time_ + ring) = time;
   } else {
-    *(iter_x_ + ring) = nanf("");
-    *(iter_y_ + ring) = nanf("");
-    *(iter_z_ + ring) = nanf("");
-    *(iter_intensity_ + ring) = ::nanf("");
-    *(iter_ring_ + ring) = ring;
-    *(iter_time_ + ring) = time;
+    x = y = z = output_intensity = std::numeric_limits<float>::quiet_NaN();
   }
+  auto * point = cloud.data.data() + offset;
+  std::memcpy(point, &x, sizeof(x));
+  std::memcpy(point + 4, &y, sizeof(y));
+  std::memcpy(point + 8, &z, sizeof(z));
+  std::memcpy(point + 12, &output_intensity, sizeof(output_intensity));
+  std::memcpy(point + 16, &ring, sizeof(ring));
+  std::memcpy(point + 18, &time, sizeof(time));
 }
 
 }  // namespace velodyne_pointcloud

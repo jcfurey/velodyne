@@ -35,6 +35,7 @@
 #include <cmath>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include <rcl_interfaces/msg/floating_point_range.hpp>
@@ -56,10 +57,13 @@ Transform::Transform(const rclcpp::NodeOptions & options)
 : rclcpp::Node("velodyne_transform_node", options),
   diagnostics_(this)
 {
-  std::string calibration_file = this->declare_parameter("calibration", "");
-  const auto model = this->declare_parameter("model", "64E");
+  rcl_interfaces::msg::ParameterDescriptor startup;
+  startup.read_only = true;
+  std::string calibration_file = this->declare_parameter("calibration", "", startup);
+  const auto model = this->declare_parameter("model", "64E", startup);
 
   rcl_interfaces::msg::ParameterDescriptor min_range_desc;
+  min_range_desc.read_only = true;
   min_range_desc.name = "min_range";
   min_range_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE;
   min_range_desc.description = "minimum range to publish";
@@ -70,6 +74,7 @@ Transform::Transform(const rclcpp::NodeOptions & options)
   double min_range = this->declare_parameter("min_range", 0.9, min_range_desc);
 
   rcl_interfaces::msg::ParameterDescriptor max_range_desc;
+  max_range_desc.read_only = true;
   max_range_desc.name = "max_range";
   max_range_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE;
   max_range_desc.description = "maximum range to publish";
@@ -80,6 +85,7 @@ Transform::Transform(const rclcpp::NodeOptions & options)
   double max_range = this->declare_parameter("max_range", 130.0, max_range_desc);
 
   rcl_interfaces::msg::ParameterDescriptor view_direction_desc;
+  view_direction_desc.read_only = true;
   view_direction_desc.name = "view_direction";
   view_direction_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE;
   view_direction_desc.description = "angle defining the center of view";
@@ -90,6 +96,7 @@ Transform::Transform(const rclcpp::NodeOptions & options)
   double view_direction = this->declare_parameter("view_direction", 0.0, view_direction_desc);
 
   rcl_interfaces::msg::ParameterDescriptor view_width_desc;
+  view_width_desc.read_only = true;
   view_width_desc.name = "view_width";
   view_width_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE;
   view_width_desc.description = "angle defining the view width";
@@ -99,11 +106,12 @@ Transform::Transform(const rclcpp::NodeOptions & options)
   view_width_desc.floating_point_range.push_back(view_width_range);
   double view_width = this->declare_parameter("view_width", 2.0 * M_PI, view_width_desc);
 
-  std::string fixed_frame = this->declare_parameter("fixed_frame", "");
-  std::string target_frame = this->declare_parameter("target_frame", "");
-  bool organize_cloud = this->declare_parameter("organize_cloud", true);
+  std::string fixed_frame = this->declare_parameter("fixed_frame", "", startup);
+  std::string target_frame = this->declare_parameter("target_frame", "", startup);
+  bool organize_cloud = this->declare_parameter("organize_cloud", true, startup);
 
   rcl_interfaces::msg::ParameterDescriptor vlp16_dual_return_mode_desc;
+  vlp16_dual_return_mode_desc.read_only = true;
   vlp16_dual_return_mode_desc.name = "vlp16_dual_return_mode";
   vlp16_dual_return_mode_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_STRING;
   vlp16_dual_return_mode_desc.description =
@@ -113,6 +121,7 @@ Transform::Transform(const rclcpp::NodeOptions & options)
     "vlp16_dual_return_mode", "both", vlp16_dual_return_mode_desc);
 
   rcl_interfaces::msg::ParameterDescriptor clip_vlp16_scan_boundaries_desc;
+  clip_vlp16_scan_boundaries_desc.read_only = true;
   clip_vlp16_scan_boundaries_desc.name = "clip_vlp16_scan_boundaries";
   clip_vlp16_scan_boundaries_desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_BOOL;
   clip_vlp16_scan_boundaries_desc.description =
@@ -121,6 +130,7 @@ Transform::Transform(const rclcpp::NodeOptions & options)
     "clip_vlp16_scan_boundaries", false, clip_vlp16_scan_boundaries_desc);
 
   rcl_interfaces::msg::ParameterDescriptor vlp16_packet_timestamp_reference_desc;
+  vlp16_packet_timestamp_reference_desc.read_only = true;
   vlp16_packet_timestamp_reference_desc.name = "vlp16_packet_timestamp_reference";
   vlp16_packet_timestamp_reference_desc.type =
     rcl_interfaces::msg::ParameterType::PARAMETER_INTEGER;
@@ -135,6 +145,12 @@ Transform::Transform(const rclcpp::NodeOptions & options)
     vlp16_packet_timestamp_reference_range);
   int vlp16_packet_timestamp_reference = this->declare_parameter(
     "vlp16_packet_timestamp_reference", 0, vlp16_packet_timestamp_reference_desc);
+
+  if (!std::isfinite(min_range) || !std::isfinite(max_range) || min_range > max_range ||
+    !std::isfinite(view_direction) || !std::isfinite(view_width))
+  {
+    throw std::invalid_argument("Invalid range or view configuration");
+  }
 
   RCLCPP_INFO(this->get_logger(), "correction angles: %s", calibration_file.c_str());
 
@@ -154,10 +170,18 @@ Transform::Transform(const rclcpp::NodeOptions & options)
   }
 
   // advertise output point cloud (before subscribing to input data)
-  output_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("velodyne_points", 10);
+  rclcpp::PublisherOptions publisher_options;
+  publisher_options.qos_overriding_options =
+    rclcpp::QosOverridingOptions::with_default_policies();
+  output_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+    "velodyne_points", rclcpp::QoS(10), publisher_options);
 
+  rclcpp::SubscriptionOptions subscription_options;
+  subscription_options.qos_overriding_options =
+    rclcpp::QosOverridingOptions::with_default_policies();
   velodyne_scan_ = this->create_subscription<velodyne_msgs::msg::VelodyneScan>(
-    "velodyne_packets", 10, std::bind(&Transform::processScan, this, std::placeholders::_1));
+    "velodyne_packets", rclcpp::SensorDataQoS(),
+    std::bind(&Transform::processScan, this, std::placeholders::_1), subscription_options);
 
   // Diagnostics
   diagnostics_.setHardwareID("Velodyne Transform");
@@ -176,8 +200,7 @@ Transform::Transform(const rclcpp::NodeOptions & options)
 
 /** @brief Callback for raw scan messages.
  *
- *  @pre TF message filter has already waited until the transform to
- *       the configured @c frame_id can succeed.
+ *  Transform availability is checked for the scan and each packet.
  */
 void Transform::processScan(
   const velodyne_msgs::msg::VelodyneScan::ConstSharedPtr scanMsg)
@@ -185,6 +208,10 @@ void Transform::processScan(
   if (output_->get_subscription_count() == 0 &&
     output_->get_intra_process_subscription_count() == 0)    // no one listening?
   {
+    return;
+  }
+
+  if (scanMsg->packets.empty()) {
     return;
   }
 

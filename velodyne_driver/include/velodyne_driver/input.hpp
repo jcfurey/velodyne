@@ -56,7 +56,11 @@
 #include <netinet/in.h>
 #include <pcap.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <rclcpp/rclcpp.hpp>
@@ -73,21 +77,30 @@ class Input
 {
 public:
   explicit Input(rclcpp::Node * private_nh, const std::string & devip, uint16_t port);
-  virtual ~Input() {}
+  virtual ~Input() = default;
+
+  // Wake replay delays without closing descriptors owned by the reader thread.
+  void requestStop();
 
   /** @brief Read one Velodyne packet.
    *
    * @param pkt points to VelodynePacket message
    *
    * @returns 0 if successful,
-   *          -1 if end of file
-   *          > 0 if incomplete packet (is this possible?)
+   *          -1 if stopped, end of file, or a permanent error,
+   *          > 0 on a transient timeout (the caller may retry)
    */
   virtual int getPacket(
     velodyne_msgs::msg::VelodynePacket * pkt,
     const double time_offset) = 0;
 
 protected:
+  bool stopped() const;
+  bool waitUntil(std::chrono::steady_clock::time_point deadline);
+
+  std::atomic<bool> stop_requested_{false};
+  std::mutex stop_mutex_;
+  std::condition_variable stop_cv_;
   rclcpp::Node * private_nh_;
   std::string devip_str_;
   uint16_t port_;
@@ -105,7 +118,6 @@ public:
   int getPacket(
     velodyne_msgs::msg::VelodynePacket * pkt,
     const double time_offset) override;
-  void setDeviceIP(const std::string & ip);
 
 private:
   int sockfd_;
@@ -136,15 +148,17 @@ public:
   int getPacket(
     velodyne_msgs::msg::VelodynePacket * pkt,
     const double time_offset) override;
-  void setDeviceIP(const std::string & ip);
 
 private:
-  rclcpp::Rate packet_rate_;
+  std::chrono::nanoseconds packet_period_;
+  std::chrono::steady_clock::time_point next_packet_time_;
   std::string filename_;
-  pcap_t * pcap_;
+  std::unique_ptr<pcap_t, decltype(&pcap_close)> pcap_{nullptr, &pcap_close};
   bpf_program pcap_packet_filter_{};
   char errbuf_[PCAP_ERRBUF_SIZE]{};
-  bool empty_;
+  bool filter_initialized_{false};
+  bool empty_{true};
+  bool exhausted_{false};
   bool read_once_;
   bool read_fast_;
   double repeat_delay_;

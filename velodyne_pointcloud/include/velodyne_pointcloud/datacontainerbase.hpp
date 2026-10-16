@@ -38,6 +38,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <memory>
 #include <string>
 
@@ -89,9 +91,6 @@ public:
     cloud.height = config_.init_height;
     cloud.is_dense = static_cast<uint8_t>(config_.is_dense);
     cloud.row_step = cloud.width * cloud.point_step;
-    // Current sensor_msgs iterators require a non-empty data buffer during
-    // construction. setup() replaces this placeholder before decoding.
-    cloud.data.resize(cloud.point_step);
   }
 
   virtual ~DataContainerBase() {}
@@ -133,9 +132,13 @@ public:
     cloud.height = config_.init_height;
     cloud.is_dense = static_cast<uint8_t>(config_.is_dense);
     cloud.row_step = cloud.width * cloud.point_step;
-    cloud.data.resize(scan_msg->packets.size() * config_.scans_per_packet * cloud.point_step);
-    // Clear out the last data; this is important in the organized cloud case
-    std::fill(cloud.data.begin(), cloud.data.end(), 0);
+    const size_t packet_bytes = static_cast<size_t>(config_.scans_per_packet) * cloud.point_step;
+    if (packet_bytes != 0 &&
+      scan_msg->packets.size() > std::numeric_limits<uint32_t>::max() / packet_bytes)
+    {
+      throw std::length_error("Velodyne scan exceeds PointCloud2 size limits");
+    }
+    cloud.data.resize(scan_msg->packets.size() * packet_bytes);
   }
 
   virtual void addPoint(
@@ -145,7 +148,7 @@ public:
 
   const sensor_msgs::msg::PointCloud2 & finishCloud()
   {
-    cloud.data.resize(cloud.point_step * cloud.width * cloud.height);
+    cloud.data.resize(static_cast<size_t>(cloud.point_step) * cloud.width * cloud.height);
     cloud.row_step = cloud.point_step * cloud.width;
 
     // If config_.target_frame is empty (the default), we use the frame_id that
@@ -169,16 +172,10 @@ public:
       return;
     }
 
-    // avoid doing transformation when sensor_frame equals target frame
-    // and no ego motion compensation is perfomed
-    if (config_.fixed_frame.empty() && sensor_frame_ == config_.target_frame) {
-      // when the string is empty the points will not be transformed later on
-      config_.target_frame = "";
-      return;
-    }
-
     // only use somewhat resource intensive tf listener when transformations are necessary
-    if (!config_.fixed_frame.empty() || !config_.target_frame.empty()) {
+    if (!config_.fixed_frame.empty() ||
+      (!config_.target_frame.empty() && config_.target_frame != sensor_frame_))
+    {
       if (!tf_buffer_) {
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(clock_);
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -190,13 +187,16 @@ public:
   }
 
   void configure(
-    const double min_range, const double max_range, const std::string & fixed_frame,
-    const std::string & target_frame)
+    const double min_range, const double max_range, const std::string & target_frame,
+    const std::string & fixed_frame)
   {
     config_.min_range = min_range;
     config_.max_range = max_range;
     config_.fixed_frame = fixed_frame;
     config_.target_frame = target_frame;
+    tf_matrix_to_fixed_.setIdentity();
+    tf_matrix_to_target_.setIdentity();
+    tf_matrix_.setIdentity();
 
     manage_tf_buffer();
   }
@@ -205,6 +205,10 @@ public:
     Eigen::Affine3f & matrix, const std::string & target_frame,
     const std::string & source_frame, const rclcpp::Time & time)
   {
+    if (target_frame == source_frame) {
+      matrix.setIdentity();
+      return true;
+    }
     if (!tf_buffer_) {
       RCLCPP_ERROR(rclcpp::get_logger("velodyne_pointcloud"), "tf buffer was not initialized yet");
       return false;
@@ -214,10 +218,7 @@ public:
     try {
       msg = tf_buffer_->lookupTransform(
         target_frame, source_frame, time, rclcpp::Duration::from_seconds(0.2));
-    } catch (tf2::LookupException & e) {
-      RCLCPP_ERROR(rclcpp::get_logger("velodyne_pointcloud"), "%s", e.what());
-      return false;
-    } catch (tf2::ExtrapolationException & e) {
+    } catch (const tf2::TransformException & e) {
       RCLCPP_ERROR(rclcpp::get_logger("velodyne_pointcloud"), "%s", e.what());
       return false;
     }
@@ -239,8 +240,10 @@ public:
       return true;
     }
     std::string & source_frame = config_.fixed_frame.empty() ? sensor_frame_ : config_.fixed_frame;
-    return calculateTransformMatrix(
+    const bool success = calculateTransformMatrix(
       tf_matrix_to_target_, config_.target_frame, source_frame, scan_time);
+    tf_matrix_ = tf_matrix_to_target_ * tf_matrix_to_fixed_;
+    return success;
   }
 
   inline bool computeTransformToFixed(const rclcpp::Time & packet_time)
@@ -250,8 +253,10 @@ public:
       return true;
     }
     std::string & source_frame = sensor_frame_;
-    return calculateTransformMatrix(
+    const bool success = calculateTransformMatrix(
       tf_matrix_to_fixed_, config_.fixed_frame, source_frame, packet_time);
+    tf_matrix_ = tf_matrix_to_target_ * tf_matrix_to_fixed_;
+    return success;
   }
 
 protected:
@@ -266,13 +271,12 @@ protected:
 
   inline void transformPoint(float & x, float & y, float & z)
   {
-    Eigen::Vector3f p = Eigen::Vector3f(x, y, z);
-    if (!config_.fixed_frame.empty()) {
-      p = tf_matrix_to_fixed_ * p;
+    if (config_.fixed_frame.empty() &&
+      (config_.target_frame.empty() || config_.target_frame == sensor_frame_))
+    {
+      return;
     }
-    if (!config_.target_frame.empty()) {
-      p = tf_matrix_to_target_ * p;
-    }
+    const Eigen::Vector3f p = tf_matrix_ * Eigen::Vector3f(x, y, z);
     x = p.x();
     y = p.y();
     z = p.z();
@@ -285,10 +289,12 @@ protected:
 
   Config config_;
   rclcpp::Clock::SharedPtr clock_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  // The listener owns a worker thread that references the buffer: destroy it first.
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-  Eigen::Affine3f tf_matrix_to_fixed_;
-  Eigen::Affine3f tf_matrix_to_target_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  Eigen::Affine3f tf_matrix_to_fixed_{Eigen::Affine3f::Identity()};
+  Eigen::Affine3f tf_matrix_to_target_{Eigen::Affine3f::Identity()};
+  Eigen::Affine3f tf_matrix_{Eigen::Affine3f::Identity()};
   std::string sensor_frame_;
 };
 }  // namespace velodyne_rawdata

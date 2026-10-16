@@ -32,11 +32,14 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <map>
+#include <numeric>
+#include <stdexcept>
+#include <vector>
 #include <string>
 #include <utility>
 
@@ -111,7 +114,6 @@ void operator>>(const YAML::Node & node, std::pair<int, LaserCorrection> & corre
     node[MAX_INTENSITY] >> max_intensity_float;
   }
 
-  correction.second.max_intensity = ::floorf(max_intensity_float);
 
   float min_intensity_float = 0.0;
 
@@ -119,7 +121,14 @@ void operator>>(const YAML::Node & node, std::pair<int, LaserCorrection> & corre
     node[MIN_INTENSITY] >> min_intensity_float;
   }
 
+  if (!std::isfinite(min_intensity_float) || !std::isfinite(max_intensity_float) ||
+    min_intensity_float < 0.0f || max_intensity_float > 255.0f ||
+    min_intensity_float > max_intensity_float)
+  {
+    throw std::runtime_error("Invalid calibration intensity limits");
+  }
   correction.second.min_intensity = ::floorf(min_intensity_float);
+  correction.second.max_intensity = ::floorf(max_intensity_float);
 
   node[FOCAL_DISTANCE] >> correction.second.focal_distance;
   node[FOCAL_SLOPE] >> correction.second.focal_slope;
@@ -145,6 +154,12 @@ void operator>>(const YAML::Node & node, Calibration & calibration)
   float distance_resolution_m;
   node[DISTANCE_RESOLUTION] >> distance_resolution_m;
   const YAML::Node & lasers = node[LASERS];
+  if (num_lasers <= 0 || num_lasers > 128 || !lasers.IsSequence() ||
+    lasers.size() != static_cast<size_t>(num_lasers) ||
+    !std::isfinite(distance_resolution_m) || distance_resolution_m <= 0.0f)
+  {
+    throw std::runtime_error("Invalid calibration laser count or distance resolution");
+  }
   calibration.laser_corrections.clear();
   calibration.num_lasers = num_lasers;
   calibration.distance_resolution_m = distance_resolution_m;
@@ -174,43 +189,39 @@ void operator>>(const YAML::Node & node, Calibration & calibration)
   }
   calibration.laser_corrections.resize(num_lasers);
 
+  std::vector<bool> seen(num_lasers, false);
   for (int i = 0; i < num_lasers; i++) {
     std::pair<int, LaserCorrection> correction;
     lasers[i] >> correction;
     const int index = correction.first;
 
-    if (static_cast<size_t>(index) >= calibration.laser_corrections.size()) {
-      calibration.laser_corrections.resize(index + 1);
+    if (index < 0 || index >= num_lasers || seen[index]) {
+      throw std::runtime_error("Calibration laser IDs must be unique and in range");
     }
+    const auto & laser = correction.second;
+    for (const float value : {laser.rot_correction, laser.vert_correction,
+        laser.dist_correction, laser.dist_correction_x, laser.dist_correction_y,
+        laser.vert_offset_correction, laser.horiz_offset_correction,
+        laser.focal_distance, laser.focal_slope})
+    {
+      if (!std::isfinite(value)) {
+        throw std::runtime_error("Calibration corrections must be finite");
+      }
+    }
+    seen[index] = true;
 
     calibration.laser_corrections[index] = (correction.second);
   }
 
-  // For each laser ring, find the next-smallest vertical angle.
-  //
-  // This implementation is simple, but not efficient.  That is OK,
-  // since it only runs while starting up.
-  double next_angle = -std::numeric_limits<double>::infinity();
-
+  // Stable sorting gives every laser a unique ring, including equal angles.
+  std::vector<int> indices(num_lasers);
+  std::iota(indices.begin(), indices.end(), 0);
+  std::stable_sort(indices.begin(), indices.end(), [&calibration](int left, int right) {
+      return calibration.laser_corrections[left].vert_correction <
+             calibration.laser_corrections[right].vert_correction;
+    });
   for (int ring = 0; ring < num_lasers; ++ring) {
-    // find minimum remaining vertical offset correction
-    double min_seen = std::numeric_limits<double>::infinity();
-    int next_index = num_lasers;
-
-    for (int j = 0; j < num_lasers; ++j) {
-      double angle = calibration.laser_corrections[j].vert_correction;
-
-      if (next_angle < angle && angle < min_seen) {
-        min_seen = angle;
-        next_index = j;
-      }
-    }
-
-    if (next_index < num_lasers) {  // anything found in this ring?
-      // store this ring number with its corresponding laser number
-      calibration.laser_corrections[next_index].laser_ring = ring;
-      next_angle = min_seen;
-    }
+    calibration.laser_corrections[indices[ring]].laser_ring = ring;
   }
 }
 

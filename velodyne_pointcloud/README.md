@@ -28,3 +28,13 @@ Parameters
 * `organize_cloud` (bool) - Whether to organize the cloud by ring (True), or to use the order as it comes directly from the driver (False).  Defaults to True.
 * `target_frame` (string) - The coordinate frame to apply to the generated point cloud header before publishing.  If the empty string (the default), the frame is passed along from the driver packet.  If this frame is different than the `fixed_frame`, a transformation to this coordinate frame is performed while creating the pointcloud.
 * `fixed_frame` (string) - The fixed coordinate frame to transform the data from.
+
+Configuration is read-only after startup. The subscription uses sensor-data QoS;
+publication defaults to reliable QoS. Both support reliability, history, and
+depth overrides as described in the repository README. A zero `view_width`
+produces no points; 2*Pi selects the full revolution.
+
+Packed XYZIRT fields retain their existing offsets and 22-byte stride. Missing
+organized-cloud slots contain NaN coordinates and valid ring IDs. VLS-128 dual
+returns use separate complete rows. Calibration laser IDs must be unique,
+contiguous from zero, and match the configured model's laser count.
